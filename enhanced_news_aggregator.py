@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import List, Dict, Any
 import sys
 import time
+import re
+from urllib.parse import urlparse
 
 class EnhancedNewsAggregator:
     def __init__(self, config_path: str):
@@ -19,26 +21,43 @@ class EnhancedNewsAggregator:
         self.all_news = []
         self.search_delay = 0.5  # Delay between searches to avoid rate limiting
 
-    def classify_news_type(self, title: str) -> str:
-        """Classify news as Domestic or International based on title content"""
-        # Keywords indicating domestic news
+    def classify_news_type(self, title: str, description: str = '') -> str:
+        """Classify news as Domestic or International based on title and description content"""
+        # Combine title and description for better classification
+        content = title + ' ' + description
+
+        # Keywords indicating domestic news (China-focused)
         domestic_keywords = ['全国', '中国', '国内', '我国', '中央', '国务院', '人大', '政协',
-                            '省', '市', '县', '乡', '村', '纪检', '监察', '党', '习近平']
+                            '省', '市', '县', '乡', '村', '纪检', '监察', '党', '习近平',
+                            '两会', '全国人大', '政府工作', '发改委', '财政部']
 
-        # Keywords indicating international news
-        international_keywords = ['美国', '韩国', '日本', '俄罗斯', '英国', '法国', '德国',
-                                 '印度', '巴西', '澳大利亚', '加拿大', '意大利', '西班牙',
-                                 '联合国', '世贸', '欧盟', '北约', '特朗普', '拜登', '普京']
+        # Keywords indicating international news (expanded list)
+        international_keywords = [
+            # Countries
+            '美国', '韩国', '日本', '俄罗斯', '英国', '法国', '德国', '印度', '巴西',
+            '澳大利亚', '加拿大', '意大利', '西班牙', '叙利亚', '伊朗', '伊拉克',
+            '阿富汗', '巴基斯坦', '以色列', '巴勒斯坦', '乌克兰', '朝鲜',
+            # International organizations
+            '联合国', '世贸', '欧盟', '北约', 'NATO', 'UN',
+            # Foreign leaders
+            '特朗普', '拜登', '普京', '泽连斯基', '金正恩',
+            # Military/conflict terms
+            'F-15', 'F-16', '战机', '空袭', '军事', '美军', '俄军', '北约军',
+            # Geographic locations (international)
+            '阿勒颇', '大马士革', '基辅', '莫斯科', '华盛顿', '东京', '首尔'
+        ]
 
-        # Check for domestic keywords
-        for keyword in domestic_keywords:
-            if keyword in title:
-                return 'Domestic'
+        # Check for domestic keywords first (higher priority for China-specific terms)
+        domestic_score = sum(1 for keyword in domestic_keywords if keyword in content)
 
         # Check for international keywords
-        for keyword in international_keywords:
-            if keyword in title:
-                return 'International'
+        international_score = sum(1 for keyword in international_keywords if keyword in content)
+
+        # If international score is higher, classify as International
+        if international_score > domestic_score:
+            return 'International'
+        elif domestic_score > 0:
+            return 'Domestic'
 
         # Default: keep original classification
         return None
@@ -107,14 +126,21 @@ class EnhancedNewsAggregator:
 
             for item in headlines[:20]:  # Limit to 20
                 fmt = api_config.get('response_format', {})
+                title = self.get_nested_field(item, fmt.get('title_field', 'title'), 'N/A')
+                description = self.get_nested_field(item, fmt.get('description_field', 'description'), '')
+
+                # Reclassify news based on content
+                reclassified_type = self.classify_news_type(title, description)
+                final_type = reclassified_type if reclassified_type else source_type
+
                 news_item = {
-                    'title': self.get_nested_field(item, fmt.get('title_field', 'title'), 'N/A'),
-                    'description': self.get_nested_field(item, fmt.get('description_field', 'description'), ''),
+                    'title': title,
+                    'description': description if description else '暂无简介',
                     'url': self.get_nested_field(item, fmt.get('url_field', 'url'), ''),
                     'image': self.get_nested_field(item, fmt.get('image_field', 'image'), ''),
                     'source': self.get_nested_field(item, fmt.get('source_field', 'source'), source_type),
                     'published_at': self.get_nested_field(item, fmt.get('published_at_field', 'publishedAt'), ''),
-                    'source_type': source_type,  # Use configured type directly
+                    'source_type': final_type,  # Use reclassified type
                     'detailed_content': ''
                 }
 
@@ -127,24 +153,54 @@ class EnhancedNewsAggregator:
             print(f"[ERROR] Error fetching {source_type} news: {str(e)}")
             return []
 
-    def enrich_with_web_search(self, news_item: Dict) -> Dict:
-        """Enrich news item with detailed content from web search"""
+    def extract_content_from_url(self, url: str) -> tuple:
+        """Extract description and image from news URL"""
         try:
-            # Use the title as search query
-            search_query = news_item['title']
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
 
-            # Note: In actual implementation, you would use Claude's WebSearch tool
-            # For now, we'll use the description as fallback
-            if news_item['description']:
-                news_item['detailed_content'] = news_item['description']
-            else:
-                news_item['detailed_content'] = f"Search results for: {search_query}"
+            html = response.text
+
+            # Extract meta description
+            description = ''
+            desc_match = re.search(r'<meta\s+(?:name|property)=["\'](?:description|og:description)["\']?\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            if desc_match:
+                description = desc_match.group(1)
+
+            # Extract og:image
+            image = ''
+            img_match = re.search(r'<meta\s+property=["\']og:image["\']?\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            if img_match:
+                image = img_match.group(1)
+
+            return description, image
+
+        except Exception as e:
+            return '', ''
+
+    def enrich_with_web_search(self, news_item: Dict) -> Dict:
+        """Enrich news item with detailed content from web page"""
+        try:
+            # If description or image is missing, try to fetch from URL
+            if (not news_item['description'] or news_item['description'] == '暂无简介') or not news_item['image']:
+                if news_item['url']:
+                    desc, img = self.extract_content_from_url(news_item['url'])
+
+                    if desc and (not news_item['description'] or news_item['description'] == '暂无简介'):
+                        news_item['description'] = desc
+                        news_item['detailed_content'] = desc
+
+                    if img and not news_item['image']:
+                        news_item['image'] = img
 
             time.sleep(self.search_delay)  # Rate limiting
             return news_item
 
         except Exception as e:
-            print(f"[WARNING] Could not enrich headline: {news_item['title'][:50]}...")
+            print(f"[WARNING] Could not enrich: {news_item['title'][:50]}...")
             return news_item
 
     def aggregate_news(self) -> List[Dict]:
@@ -357,6 +413,14 @@ class EnhancedNewsAggregator:
             color: #999;
         }}
 
+        .news-image {{
+            width: 100%;
+            max-height: 200px;
+            object-fit: cover;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }}
+
         .news-summary {{
             color: #666;
             font-size: 0.95em;
@@ -454,9 +518,14 @@ class EnhancedNewsAggregator:
         badge_text = '🌐 国际' if news['source_type'] == 'International' else '🏠 国内'
 
         # Get summary from description or detailed_content
-        summary = news.get('description', '') or news.get('detailed_content', '')
-        if len(summary) > 300:
+        summary = news.get('description', '') or news.get('detailed_content', '') or '暂无简介'
+        if summary and len(summary) > 300:
             summary = summary[:300] + '...'
+
+        # Generate image HTML if available
+        image_html = ''
+        if news.get('image'):
+            image_html = f'<img src="{news["image"]}" alt="新闻配图" class="news-image" onerror="this.style.display=\'none\'">'
 
         return f"""<div class="news-item">
             <div class="news-left">
@@ -468,6 +537,7 @@ class EnhancedNewsAggregator:
                 </div>
             </div>
             <div class="news-right">
+                {image_html}
                 <p class="news-summary">{summary}</p>
                 <a href="{news['url']}" target="_blank" class="news-link">阅读全文 →</a>
             </div>
