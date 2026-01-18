@@ -19,43 +19,26 @@ class EnhancedNewsAggregator:
         self.all_news = []
         self.search_delay = 0.5  # Delay between searches to avoid rate limiting
 
-    def classify_news_type(self, title: str, description: str = '') -> str:
-        """Classify news as Domestic or International based on title and description content"""
-        # Combine title and description for better classification
-        content = title + ' ' + description
-
-        # Keywords indicating domestic news (China-focused)
+    def classify_news_type(self, title: str) -> str:
+        """Classify news as Domestic or International based on title content"""
+        # Keywords indicating domestic news
         domestic_keywords = ['全国', '中国', '国内', '我国', '中央', '国务院', '人大', '政协',
-                            '省', '市', '县', '乡', '村', '纪检', '监察', '党', '习近平',
-                            '两会', '全国人大', '政府工作', '发改委', '财政部']
+                            '省', '市', '县', '乡', '村', '纪检', '监察', '党', '习近平']
 
-        # Keywords indicating international news (expanded list)
-        international_keywords = [
-            # Countries
-            '美国', '韩国', '日本', '俄罗斯', '英国', '法国', '德国', '印度', '巴西',
-            '澳大利亚', '加拿大', '意大利', '西班牙', '叙利亚', '伊朗', '伊拉克',
-            '阿富汗', '巴基斯坦', '以色列', '巴勒斯坦', '乌克兰', '朝鲜',
-            # International organizations
-            '联合国', '世贸', '欧盟', '北约', 'NATO', 'UN',
-            # Foreign leaders
-            '特朗普', '拜登', '普京', '泽连斯基', '金正恩',
-            # Military/conflict terms
-            'F-15', 'F-16', '战机', '空袭', '军事', '美军', '俄军', '北约军',
-            # Geographic locations (international)
-            '阿勒颇', '大马士革', '基辅', '莫斯科', '华盛顿', '东京', '首尔'
-        ]
+        # Keywords indicating international news
+        international_keywords = ['美国', '韩国', '日本', '俄罗斯', '英国', '法国', '德国',
+                                 '印度', '巴西', '澳大利亚', '加拿大', '意大利', '西班牙',
+                                 '联合国', '世贸', '欧盟', '北约', '特朗普', '拜登', '普京']
 
-        # Check for domestic keywords first (higher priority for China-specific terms)
-        domestic_score = sum(1 for keyword in domestic_keywords if keyword in content)
+        # Check for domestic keywords
+        for keyword in domestic_keywords:
+            if keyword in title:
+                return 'Domestic'
 
         # Check for international keywords
-        international_score = sum(1 for keyword in international_keywords if keyword in content)
-
-        # If international score is higher, classify as International
-        if international_score > domestic_score:
-            return 'International'
-        elif domestic_score > 0:
-            return 'Domestic'
+        for keyword in international_keywords:
+            if keyword in title:
+                return 'International'
 
         # Default: keep original classification
         return None
@@ -124,21 +107,14 @@ class EnhancedNewsAggregator:
 
             for item in headlines[:20]:  # Limit to 20
                 fmt = api_config.get('response_format', {})
-                title = self.get_nested_field(item, fmt.get('title_field', 'title'), 'N/A')
-                description = self.get_nested_field(item, fmt.get('description_field', 'description'), '')
-
-                # Reclassify news based on content
-                reclassified_type = self.classify_news_type(title, description)
-                final_type = reclassified_type if reclassified_type else source_type
-
                 news_item = {
-                    'title': title,
-                    'description': description if description else '暂无简介',
+                    'title': self.get_nested_field(item, fmt.get('title_field', 'title'), 'N/A'),
+                    'description': self.get_nested_field(item, fmt.get('description_field', 'description'), ''),
                     'url': self.get_nested_field(item, fmt.get('url_field', 'url'), ''),
                     'image': self.get_nested_field(item, fmt.get('image_field', 'image'), ''),
                     'source': self.get_nested_field(item, fmt.get('source_field', 'source'), source_type),
                     'published_at': self.get_nested_field(item, fmt.get('published_at_field', 'publishedAt'), ''),
-                    'source_type': final_type,  # Use reclassified type
+                    'source_type': source_type,  # Use configured type directly
                     'detailed_content': ''
                 }
 
