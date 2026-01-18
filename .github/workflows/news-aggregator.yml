@@ -32,12 +32,14 @@ jobs:
               {
                 "name": "NewsAPI-国际新闻",
                 "type": "International",
-                "endpoint": "https://newsapi.org/v2/top-headlines",
+                "endpoint": "https://newsapi.org/v2/everything",
                 "auth_type": "api_key",
                 "params": {
                   "apiKey": "${{ secrets.NEWSAPI_KEY }}",
-                  "country": "us",
-                  "pageSize": 20
+                  "q": "international OR world OR global OR foreign",
+                  "language": "en",
+                  "sortBy": "publishedAt",
+                  "pageSize": 30
                 },
                 "response_format": {
                   "headlines_path": "articles",
