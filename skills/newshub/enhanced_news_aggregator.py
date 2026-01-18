@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import List, Dict, Any
 import sys
 import time
+import re
+from urllib.parse import urlparse
 
 class EnhancedNewsAggregator:
     def __init__(self, config_path: str):
@@ -151,24 +153,54 @@ class EnhancedNewsAggregator:
             print(f"[ERROR] Error fetching {source_type} news: {str(e)}")
             return []
 
-    def enrich_with_web_search(self, news_item: Dict) -> Dict:
-        """Enrich news item with detailed content from web search"""
+    def extract_content_from_url(self, url: str) -> tuple:
+        """Extract description and image from news URL"""
         try:
-            # Use the title as search query
-            search_query = news_item['title']
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
 
-            # Note: In actual implementation, you would use Claude's WebSearch tool
-            # For now, we'll use the description as fallback
-            if news_item['description']:
-                news_item['detailed_content'] = news_item['description']
-            else:
-                news_item['detailed_content'] = f"Search results for: {search_query}"
+            html = response.text
+
+            # Extract meta description
+            description = ''
+            desc_match = re.search(r'<meta\s+(?:name|property)=["\'](?:description|og:description)["\']?\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            if desc_match:
+                description = desc_match.group(1)
+
+            # Extract og:image
+            image = ''
+            img_match = re.search(r'<meta\s+property=["\']og:image["\']?\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            if img_match:
+                image = img_match.group(1)
+
+            return description, image
+
+        except Exception as e:
+            return '', ''
+
+    def enrich_with_web_search(self, news_item: Dict) -> Dict:
+        """Enrich news item with detailed content from web page"""
+        try:
+            # If description or image is missing, try to fetch from URL
+            if (not news_item['description'] or news_item['description'] == '暂无简介') or not news_item['image']:
+                if news_item['url']:
+                    desc, img = self.extract_content_from_url(news_item['url'])
+
+                    if desc and (not news_item['description'] or news_item['description'] == '暂无简介'):
+                        news_item['description'] = desc
+                        news_item['detailed_content'] = desc
+
+                    if img and not news_item['image']:
+                        news_item['image'] = img
 
             time.sleep(self.search_delay)  # Rate limiting
             return news_item
 
         except Exception as e:
-            print(f"[WARNING] Could not enrich headline: {news_item['title'][:50]}...")
+            print(f"[WARNING] Could not enrich: {news_item['title'][:50]}...")
             return news_item
 
     def aggregate_news(self) -> List[Dict]:
@@ -381,6 +413,14 @@ class EnhancedNewsAggregator:
             color: #999;
         }}
 
+        .news-image {{
+            width: 100%;
+            max-height: 200px;
+            object-fit: cover;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }}
+
         .news-summary {{
             color: #666;
             font-size: 0.95em;
@@ -478,9 +518,14 @@ class EnhancedNewsAggregator:
         badge_text = '🌐 国际' if news['source_type'] == 'International' else '🏠 国内'
 
         # Get summary from description or detailed_content
-        summary = news.get('description', '') or news.get('detailed_content', '')
-        if len(summary) > 300:
+        summary = news.get('description', '') or news.get('detailed_content', '') or '暂无简介'
+        if summary and len(summary) > 300:
             summary = summary[:300] + '...'
+
+        # Generate image HTML if available
+        image_html = ''
+        if news.get('image'):
+            image_html = f'<img src="{news["image"]}" alt="新闻配图" class="news-image" onerror="this.style.display=\'none\'">'
 
         return f"""<div class="news-item">
             <div class="news-left">
@@ -492,6 +537,7 @@ class EnhancedNewsAggregator:
                 </div>
             </div>
             <div class="news-right">
+                {image_html}
                 <p class="news-summary">{summary}</p>
                 <a href="{news['url']}" target="_blank" class="news-link">阅读全文 →</a>
             </div>
