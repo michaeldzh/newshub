@@ -11,7 +11,8 @@ from typing import List, Dict, Any
 import sys
 import time
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+import html
 
 class EnhancedNewsAggregator:
     def __init__(self, config_path: str):
@@ -162,19 +163,23 @@ class EnhancedNewsAggregator:
             response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
 
-            html = response.text
+            # Handle encoding properly
+            response.encoding = response.apparent_encoding
+            html_content = response.text
 
             # Extract meta description
             description = ''
-            desc_match = re.search(r'<meta\s+(?:name|property)=["\'](?:description|og:description)["\']?\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            desc_match = re.search(r'<meta\s+(?:name|property)=["\'](?:description|og:description)["\']?\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             if desc_match:
-                description = desc_match.group(1)
+                description = html.unescape(desc_match.group(1))
 
             # Extract og:image
             image = ''
-            img_match = re.search(r'<meta\s+property=["\']og:image["\']?\s+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+            img_match = re.search(r'<meta\s+property=["\']og:image["\']?\s+content=["\']([^"\']+)["\']', html_content, re.IGNORECASE)
             if img_match:
-                image = img_match.group(1)
+                image_url = img_match.group(1)
+                # Convert relative URL to absolute URL
+                image = urljoin(url, image_url)
 
             return description, image
 
@@ -203,6 +208,22 @@ class EnhancedNewsAggregator:
             print(f"[WARNING] Could not enrich: {news_item['title'][:50]}...")
             return news_item
 
+    def balance_news_count(self, news_list: List[Dict], target_per_type: int = 10) -> List[Dict]:
+        """Balance news count to ensure equal distribution between Domestic and International"""
+        domestic_news = [n for n in news_list if n['source_type'] == 'Domestic']
+        international_news = [n for n in news_list if n['source_type'] == 'International']
+
+        print(f"[INFO] Before balancing: {len(domestic_news)} domestic, {len(international_news)} international")
+
+        # Take target number from each type
+        balanced_news = []
+        balanced_news.extend(domestic_news[:target_per_type])
+        balanced_news.extend(international_news[:target_per_type])
+
+        print(f"[INFO] After balancing: {len([n for n in balanced_news if n['source_type'] == 'Domestic'])} domestic, {len([n for n in balanced_news if n['source_type'] == 'International'])} international")
+
+        return balanced_news
+
     def aggregate_news(self) -> List[Dict]:
         """Aggregate news from all configured APIs"""
         print("\n" + "="*50)
@@ -218,6 +239,9 @@ class EnhancedNewsAggregator:
 
         # Remove duplicates based on title
         self.all_news = self.remove_duplicates(self.all_news)
+
+        # Balance news count to ensure equal distribution
+        self.all_news = self.balance_news_count(self.all_news, target_per_type=10)
 
         print(f"\n[OK] Total news items aggregated: {len(self.all_news)}\n")
         return self.all_news
