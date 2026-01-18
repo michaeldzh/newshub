@@ -1,0 +1,100 @@
+name: Daily News Aggregator
+
+on:
+  schedule:
+    # 每天北京时间早上 8:00 执行 (UTC 0:00)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  aggregate-news:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          cd skills/newshub
+          pip install -r requirements.txt
+
+      - name: Generate API config from secrets
+        run: |
+          cat > skills/newshub/api-config.json << 'EOF'
+          {
+            "news_sources": [
+              {
+                "name": "NewsAPI-国际新闻",
+                "type": "International",
+                "endpoint": "https://newsapi.org/v2/top-headlines",
+                "auth_type": "api_key",
+                "params": {
+                  "apiKey": "${{ secrets.NEWSAPI_KEY }}",
+                  "country": "us",
+                  "pageSize": 20
+                },
+                "response_format": {
+                  "headlines_path": "articles",
+                  "title_field": "title",
+                  "description_field": "description",
+                  "url_field": "url",
+                  "image_field": "urlToImage",
+                  "source_field": "source.name",
+                  "published_at_field": "publishedAt"
+                }
+              },
+              {
+                "name": "天行数据-国内新闻",
+                "type": "Domestic",
+                "endpoint": "https://apis.tianapi.com/guonei/index",
+                "auth_type": "api_key",
+                "params": {
+                  "key": "${{ secrets.TIANAPI_KEY }}",
+                  "num": 20
+                },
+                "response_format": {
+                  "headlines_path": "result.newslist",
+                  "title_field": "title",
+                  "description_field": "description",
+                  "url_field": "url",
+                  "image_field": "picUrl",
+                  "source_field": "source",
+                  "published_at_field": "ctime"
+                }
+              }
+            ],
+            "output": {
+              "report_filename": "index.html",
+              "report_title": "全球新闻汇总"
+            }
+          }
+          EOF
+
+      - name: Run news aggregator with Claude Agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+        run: |
+          cd skills/newshub
+          python run_with_claude.py
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./skills/newshub
+          publish_branch: gh-pages
+          keep_files: false
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-report-${{ github.run_number }}
+          path: skills/newshub/index.html
+          retention-days: 30

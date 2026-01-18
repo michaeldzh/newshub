@@ -1,0 +1,51 @@
+{
+  "international_api": {
+    "name": "NewsAPI (International)",
+    "endpoint": "https://newsapi.org/v2/top-headlines",
+    "method": "GET",
+    "auth_type": "api_key",
+    "auth_header": "YOUR_NEWSAPI_KEY",
+    "params": {
+      "country": "us",
+      "sortBy": "popularity",
+      "pageSize": 10
+    },
+    "response_format": {
+      "headlines_path": "articles",
+      "title_field": "title",
+      "description_field": "description",
+      "url_field": "url",
+      "image_field": "urlToImage",
+      "source_field": "source.name",
+      "published_at_field": "publishedAt"
+    }
+  },
+  "domestic_api": {
+    "name": "Domestic News API",
+    "endpoint": "https://api.example.com/v1/news",
+    "method": "GET",
+    "auth_type": "bearer",
+    "auth_header": "YOUR_BEARER_TOKEN",
+    "params": {
+      "region": "domestic",
+      "limit": 10,
+      "sort": "trending"
+    },
+    "response_format": {
+      "headlines_path": "data.articles",
+      "title_field": "title",
+      "description_field": "summary",
+      "url_field": "link",
+      "image_field": "image",
+      "source_field": "source",
+      "published_at_field": "timestamp"
+    }
+  },
+  "output": {
+    "report_filename": "global_news_report.html",
+    "report_title": "Global News Digest",
+    "include_images": true,
+    "include_timestamps": true,
+    "items_per_page": 20
+  }
+}

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# API 配置文件（包含密钥，不应提交）
+skills/newshub/api-config.json
+.claude/skills/newshub/api-config.json
+
+# 生成的报告
+skills/newshub/*.html
+skills/newshub/global_news_report.html
+
+# 日志
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

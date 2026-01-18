@@ -1,0 +1,47 @@
+{
+  "news_sources": [
+    {
+      "name": "NewsAPI-国际新闻",
+      "type": "International",
+      "endpoint": "https://newsapi.org/v2/top-headlines",
+      "auth_type": "api_key",
+      "params": {
+        "apiKey": "YOUR_NEWSAPI_KEY_HERE",
+        "country": "us",
+        "pageSize": 20
+      },
+      "response_format": {
+        "headlines_path": "articles",
+        "title_field": "title",
+        "description_field": "description",
+        "url_field": "url",
+        "image_field": "urlToImage",
+        "source_field": "source.name",
+        "published_at_field": "publishedAt"
+      }
+    },
+    {
+      "name": "天行数据-国内新闻",
+      "type": "Domestic",
+      "endpoint": "https://apis.tianapi.com/guonei/index",
+      "auth_type": "api_key",
+      "params": {
+        "key": "YOUR_TIANAPI_KEY_HERE",
+        "num": 20
+      },
+      "response_format": {
+        "headlines_path": "result.newslist",
+        "title_field": "title",
+        "description_field": "description",
+        "url_field": "url",
+        "image_field": "picUrl",
+        "source_field": "source",
+        "published_at_field": "ctime"
+      }
+    }
+  ],
+  "output": {
+    "report_filename": "index.html",
+    "report_title": "全球新闻汇总"
+  }
+}
