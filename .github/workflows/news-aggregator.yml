@@ -4,6 +4,8 @@ on:
   schedule:
     # 每天北京时间早上 8:00 执行 (UTC 0:00)
     - cron: '0 0 * * *'
+    # 每天北京时间下午 15:00 执行 (UTC 7:00)
+    - cron: '0 7 * * *'
   workflow_dispatch: # 允许手动触发
 
 jobs:
@@ -31,7 +33,7 @@ jobs:
             "news_sources": [
               {
                 "name": "NewsAPI-国际新闻",
-                "type": "International",
+                "type": "国际",
                 "endpoint": "https://newsapi.org/v2/everything",
                 "auth_type": "api_key",
                 "params": {
@@ -53,7 +55,7 @@ jobs:
               },
               {
                 "name": "天行数据-国内新闻",
-                "type": "Domestic",
+                "type": "国内",
                 "endpoint": "https://apis.tianapi.com/guonei/index",
                 "auth_type": "api_key",
                 "params": {
@@ -72,7 +74,7 @@ jobs:
               },
               {
                 "name": "天行数据-社会新闻",
-                "type": "Domestic",
+                "type": "国内",
                 "endpoint": "https://apis.tianapi.com/social/index",
                 "auth_type": "api_key",
                 "params": {
@@ -91,7 +93,7 @@ jobs:
               },
               {
                 "name": "天行数据-科技新闻",
-                "type": "Domestic",
+                "type": "科技",
                 "endpoint": "https://apis.tianapi.com/keji/index",
                 "auth_type": "api_key",
                 "params": {
@@ -110,7 +112,7 @@ jobs:
               },
               {
                 "name": "天行数据-财经新闻",
-                "type": "Domestic",
+                "type": "国内",
                 "endpoint": "https://apis.tianapi.com/caijing/index",
                 "auth_type": "api_key",
                 "params": {
@@ -129,7 +131,7 @@ jobs:
               },
               {
                 "name": "天行数据-国际新闻",
-                "type": "International",
+                "type": "国际",
                 "endpoint": "https://apis.tianapi.com/world/index",
                 "auth_type": "api_key",
                 "params": {
@@ -148,7 +150,7 @@ jobs:
               },
               {
                 "name": "天行数据-AI新闻",
-                "type": "Domestic",
+                "type": "科技",
                 "endpoint": "https://apis.tianapi.com/ai/index",
                 "auth_type": "api_key",
                 "params": {
@@ -167,7 +169,7 @@ jobs:
               },
               {
                 "name": "天行数据-健康新闻",
-                "type": "Domestic",
+                "type": "国内",
                 "endpoint": "https://apis.tianapi.com/health/index",
                 "auth_type": "api_key",
                 "params": {
