@@ -68,13 +68,31 @@ class EnhancedNewsAggregator:
             '航天', '卫星', '火箭', '探测器', '空间站'
         ]
 
-        # Domestic keywords
+        # Domestic keywords (comprehensive list)
         domestic_keywords = [
+            # National level
             '全国', '中国', '国内', '我国', '中央', '国务院', '人大', '政协',
-            '省', '市', '县', '乡', '村', '纪检', '监察', '党', '习近平',
-            '两会', '全国人大', '政府工作', '发改委', '财政部',
-            '港澳台', '香港', '澳门', '台湾', '台海', '两岸',
-            '民生', '就业', '医保', '养老', '教育', '房价'
+            '两会', '全国人大', '政府工作', '发改委', '财政部', '纪检', '监察', '党', '习近平',
+            # Provinces (34)
+            '北京', '上海', '天津', '重庆',
+            '河北', '山西', '辽宁', '吉林', '黑龙江',
+            '江苏', '浙江', '安徽', '福建', '江西', '山东',
+            '河南', '湖北', '湖南', '广东', '海南',
+            '四川', '贵州', '云南', '陕西', '甘肃', '青海',
+            '内蒙古', '广西', '西藏', '宁夏', '新疆',
+            '香港', '澳门', '台湾', '港澳台', '台海', '两岸',
+            # Major cities
+            '深圳', '广州', '成都', '杭州', '武汉', '西安', '郑州', '南京', '苏州',
+            '长沙', '沈阳', '青岛', '济南', '哈尔滨', '长春', '合肥', '南昌', '福州',
+            '厦门', '昆明', '兰州', '太原', '石家庄', '呼和浩特', '乌鲁木齐', '拉萨',
+            '银川', '西宁', '南宁', '贵阳', '海口', '三亚', '洛阳', '包头',
+            # Domestic enterprises
+            '包钢', '宝钢', '鞍钢', '中石油', '中石化', '中海油', '国家电网', '南方电网',
+            '中国移动', '中国联通', '中国电信', '华为', '小米', '阿里', '腾讯', '百度',
+            '京东', '美团', '滴滴', '比亚迪', '吉利', '长城汽车', '蔚来', '理想',
+            # Domestic affairs
+            '省', '市', '县', '乡', '村', '民生', '就业', '医保', '养老', '教育', '房价',
+            '成品油', '油价', '景区', '旅游', '春运', '高铁', '地铁'
         ]
 
         # International keywords
@@ -242,21 +260,47 @@ class EnhancedNewsAggregator:
         except Exception as e:
             return '', '', ''
 
+    def is_incomplete_summary(self, text: str) -> bool:
+        """Check if summary appears to be incomplete"""
+        if not text or text == '暂无简介':
+            return True
+
+        text = text.strip()
+
+        # Check if ends with ellipsis or incomplete patterns
+        if text.endswith('...') or text.endswith('..'):
+            return True
+
+        # Check if too short (less than 50 chars)
+        if len(text) < 50:
+            return True
+
+        # Check if ends with incomplete sentence (ends with digit followed by ellipsis pattern)
+        if len(text) > 2 and text[-2:].isdigit():
+            return True
+
+        return False
+
     def enrich_with_web_search(self, news_item: Dict) -> Dict:
         """Enrich news item with detailed content from web page"""
         try:
-            # Only fetch description if missing, do NOT fetch images to avoid mismatches
-            if not news_item['description'] or news_item['description'] == '暂无简介':
-                if news_item['url']:
-                    desc, _, web_source = self.extract_content_from_url(news_item['url'])
+            # Fetch description if missing or incomplete
+            should_fetch = (
+                not news_item['description'] or
+                news_item['description'] == '暂无简介' or
+                self.is_incomplete_summary(news_item['description'])
+            )
 
-                    if desc:
-                        news_item['description'] = desc
-                        news_item['detailed_content'] = desc
+            if should_fetch and news_item['url']:
+                desc, _, web_source = self.extract_content_from_url(news_item['url'])
 
-                    # Update source if found on web page
-                    if web_source:
-                        news_item['source'] = web_source
+                if desc and len(desc) > len(news_item.get('description', '')):
+                    news_item['description'] = desc
+                    news_item['detailed_content'] = desc
+
+                # Update source if found on web page
+                if web_source:
+                    news_item['source'] = web_source
 
             time.sleep(self.search_delay)  # Rate limiting
             return news_item
@@ -643,6 +687,42 @@ class EnhancedNewsAggregator:
 </html>"""
         return html
 
+    def add_punctuation_to_summary(self, text: str) -> str:
+        """Add punctuation to summary text that lacks proper punctuation"""
+        if not text or text == '暂无简介':
+            return text
+
+        text = text.strip()
+        result = []
+        last_punct_pos = 0
+
+        for i, char in enumerate(text):
+            result.append(char)
+
+            # Check if current char is punctuation
+            if char in '。！？；，.!?;,':
+                last_punct_pos = i
+            else:
+                # If no punctuation for 50+ chars, add comma after certain words
+                if i - last_punct_pos > 50:
+                    # Add comma after common sentence-ending particles
+                    if char in '的了着过' and i < len(text) - 1:
+                        result.append('，')
+                        last_punct_pos = i
+                    # Add period before numbered items (01, 02, etc.)
+                    elif i < len(text) - 2 and text[i:i+2].isdigit():
+                        if result[-1] not in '。！？；，.!?;,':
+                            result.insert(-1, '。')
+                            last_punct_pos = i
+
+        text = ''.join(result)
+
+        # Ensure ends with proper punctuation
+        if text and text[-1] not in '。！？；，.!?;,':
+            text += '。'
+
+        return text
+
     def _generate_news_card(self, news: Dict, index: int) -> str:
         """Generate a single news card HTML with vertical layout"""
         badge_class = 'badge-international' if news['source_type'] == '国际' else ('badge-tech' if news['source_type'] == '科技' else 'badge-domestic')
@@ -651,11 +731,8 @@ class EnhancedNewsAggregator:
         # Get summary from description or detailed_content (no truncation)
         summary = news.get('description', '') or news.get('detailed_content', '') or '暂无简介'
 
-        # Ensure summary ends with proper punctuation
-        if summary and summary != '暂无简介':
-            summary = summary.strip()
-            if summary and summary[-1] not in '。！？；，.!?;,':
-                summary += '。'
+        # Add punctuation to summary
+        summary = self.add_punctuation_to_summary(summary)
 
         # Generate image HTML if available
         image_html = ''
