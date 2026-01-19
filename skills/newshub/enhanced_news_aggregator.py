@@ -189,7 +189,7 @@ class EnhancedNewsAggregator:
             return []
 
     def extract_content_from_url(self, url: str) -> tuple:
-        """Extract description and image from news URL"""
+        """Extract description, image, and source from news URL"""
         try:
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -215,10 +215,24 @@ class EnhancedNewsAggregator:
                 # Convert relative URL to absolute URL
                 image = urljoin(url, image_url)
 
-            return description, image
+            # Extract source from page (common patterns)
+            source = ''
+            source_patterns = [
+                r'来源[：:]\s*([^\s<>]{2,10})',
+                r'<span[^>]*class=["\'][^"\']*source[^"\']*["\'][^>]*>([^<]{2,10})</span>',
+                r'<div[^>]*class=["\'][^"\']*source[^"\']*["\'][^>]*>([^<]{2,10})</div>',
+            ]
+            for pattern in source_patterns:
+                src_match = re.search(pattern, html_content, re.IGNORECASE)
+                if src_match:
+                    source = html.unescape(src_match.group(1).strip())
+                    if source and len(source) >= 2:
+                        break
+
+            return description, image, source
 
         except Exception as e:
-            return '', ''
+            return '', '', ''
 
     def enrich_with_web_search(self, news_item: Dict) -> Dict:
         """Enrich news item with detailed content from web page"""
@@ -226,11 +240,15 @@ class EnhancedNewsAggregator:
             # Only fetch description if missing, do NOT fetch images to avoid mismatches
             if not news_item['description'] or news_item['description'] == '暂无简介':
                 if news_item['url']:
-                    desc, _ = self.extract_content_from_url(news_item['url'])
+                    desc, _, web_source = self.extract_content_from_url(news_item['url'])
 
                     if desc:
                         news_item['description'] = desc
                         news_item['detailed_content'] = desc
+
+                    # Update source if found on web page
+                    if web_source:
+                        news_item['source'] = web_source
 
             time.sleep(self.search_delay)  # Rate limiting
             return news_item
