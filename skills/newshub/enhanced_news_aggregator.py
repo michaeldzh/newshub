@@ -22,6 +22,29 @@ class EnhancedNewsAggregator:
         self.all_news = []
         self.search_delay = 0.5  # Delay between searches to avoid rate limiting
 
+    def extract_news_source(self, title: str, description: str = '', fallback_source: str = '') -> str:
+        """Extract original news source from title or description"""
+        content = title + ' ' + description
+
+        # Common patterns for news sources
+        patterns = [
+            r'据([^报道消息讯]{2,6})报道',
+            r'([^报道消息讯]{2,6})消息',
+            r'([^报道消息讯]{2,6})讯',
+            r'来源[：:]\s*([^\s]{2,10})',
+            r'\(([^)]{2,6})\)$',  # Source in parentheses at end
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, content)
+            if match:
+                source = match.group(1).strip()
+                # Filter out common non-source words
+                if source and len(source) >= 2 and source not in ['记者', '编辑', '本报', '本网']:
+                    return source
+
+        return fallback_source
+
     def classify_news_type(self, title: str, description: str = '') -> str:
         """Classify news as Domestic or International based on title and description content"""
         # Combine title and description for better classification
@@ -34,18 +57,25 @@ class EnhancedNewsAggregator:
 
         # Keywords indicating international news (expanded list)
         international_keywords = [
+            # Regions and continents
+            '欧洲', '亚洲', '非洲', '美洲', '大洋洲', '中东', '东南亚', '南亚', '拉美',
             # Countries
             '美国', '韩国', '日本', '俄罗斯', '英国', '法国', '德国', '印度', '巴西',
             '澳大利亚', '加拿大', '意大利', '西班牙', '叙利亚', '伊朗', '伊拉克',
-            '阿富汗', '巴基斯坦', '以色列', '巴勒斯坦', '乌克兰', '朝鲜',
+            '阿富汗', '巴基斯坦', '以色列', '巴勒斯坦', '乌克兰', '朝鲜', '越南',
+            '泰国', '新加坡', '马来西亚', '印尼', '菲律宾', '墨西哥', '阿根廷',
+            # Multi-country terms
+            '八国', '七国', '二十国', 'G7', 'G20', '联合国', '北约', '欧盟',
             # International organizations
-            '联合国', '世贸', '欧盟', '北约', 'NATO', 'UN',
+            '世贸', 'NATO', 'UN', 'WHO', 'IMF', '世界银行',
             # Foreign leaders
-            '特朗普', '拜登', '普京', '泽连斯基', '金正恩',
+            '特朗普', '拜登', '普京', '泽连斯基', '金正恩', '马克龙', '朔尔茨',
             # Military/conflict terms
             'F-15', 'F-16', '战机', '空袭', '军事', '美军', '俄军', '北约军',
             # Geographic locations (international)
-            '阿勒颇', '大马士革', '基辅', '莫斯科', '华盛顿', '东京', '首尔'
+            '阿勒颇', '大马士革', '基辅', '莫斯科', '华盛顿', '东京', '首尔',
+            # Economic terms
+            '关税', '贸易战', '制裁', '禁运'
         ]
 
         # Check for domestic keywords first (higher priority for China-specific terms)
@@ -134,12 +164,16 @@ class EnhancedNewsAggregator:
                 reclassified_type = self.classify_news_type(title, description)
                 final_type = reclassified_type if reclassified_type else source_type
 
+                # Extract original news source from content
+                api_source = self.get_nested_field(item, fmt.get('source_field', 'source'), source_type)
+                final_source = self.extract_news_source(title, description, api_source)
+
                 news_item = {
                     'title': title,
                     'description': description if description else '暂无简介',
                     'url': self.get_nested_field(item, fmt.get('url_field', 'url'), ''),
                     'image': self.get_nested_field(item, fmt.get('image_field', 'image'), ''),
-                    'source': self.get_nested_field(item, fmt.get('source_field', 'source'), source_type),
+                    'source': final_source,
                     'published_at': self.get_nested_field(item, fmt.get('published_at_field', 'publishedAt'), ''),
                     'source_type': final_type,  # Use reclassified type
                     'detailed_content': ''
