@@ -46,51 +46,50 @@ class EnhancedNewsAggregator:
         return fallback_source
 
     def classify_news_type(self, title: str, description: str = '') -> str:
-        """Classify news as Domestic or International based on title and description content"""
-        # Combine title and description for better classification
+        """Classify news into three categories: 国内, 国际, 科技"""
         content = title + ' ' + description
 
-        # Keywords indicating domestic news (China-focused)
-        domestic_keywords = ['全国', '中国', '国内', '我国', '中央', '国务院', '人大', '政协',
-                            '省', '市', '县', '乡', '村', '纪检', '监察', '党', '习近平',
-                            '两会', '全国人大', '政府工作', '发改委', '财政部']
-
-        # Keywords indicating international news (expanded list)
-        international_keywords = [
-            # Regions and continents
-            '欧洲', '亚洲', '非洲', '美洲', '大洋洲', '中东', '东南亚', '南亚', '拉美',
-            # Countries
-            '美国', '韩国', '日本', '俄罗斯', '英国', '法国', '德国', '印度', '巴西',
-            '澳大利亚', '加拿大', '意大利', '西班牙', '叙利亚', '伊朗', '伊拉克',
-            '阿富汗', '巴基斯坦', '以色列', '巴勒斯坦', '乌克兰', '朝鲜', '越南',
-            '泰国', '新加坡', '马来西亚', '印尼', '菲律宾', '墨西哥', '阿根廷',
-            # Multi-country terms
-            '八国', '七国', '二十国', 'G7', 'G20', '联合国', '北约', '欧盟',
-            # International organizations
-            '世贸', 'NATO', 'UN', 'WHO', 'IMF', '世界银行',
-            # Foreign leaders
-            '特朗普', '拜登', '普京', '泽连斯基', '金正恩', '马克龙', '朔尔茨',
-            # Military/conflict terms
-            'F-15', 'F-16', '战机', '空袭', '军事', '美军', '俄军', '北约军',
-            # Geographic locations (international)
-            '阿勒颇', '大马士革', '基辅', '莫斯科', '华盛顿', '东京', '首尔',
-            # Economic terms
-            '关税', '贸易战', '制裁', '禁运'
+        # Tech keywords (highest priority)
+        tech_keywords = [
+            'AI', '人工智能', '机器学习', '深度学习', 'ChatGPT', 'GPT', '大模型',
+            '芯片', '半导体', '5G', '6G', '量子', '区块链', '元宇宙',
+            '科技', '技术', '互联网', '软件', '硬件', '算法', '数据',
+            'iPhone', 'Android', '华为', '小米', 'OPPO', 'vivo',
+            '特斯拉', '新能源', '电动车', '自动驾驶', '无人机',
+            '航天', '卫星', '火箭', '探测器', '空间站'
         ]
 
-        # Check for domestic keywords first (higher priority for China-specific terms)
-        domestic_score = sum(1 for keyword in domestic_keywords if keyword in content)
+        # Domestic keywords
+        domestic_keywords = [
+            '全国', '中国', '国内', '我国', '中央', '国务院', '人大', '政协',
+            '省', '市', '县', '乡', '村', '纪检', '监察', '党', '习近平',
+            '两会', '全国人大', '政府工作', '发改委', '财政部',
+            '港澳台', '香港', '澳门', '台湾', '台海', '两岸',
+            '民生', '就业', '医保', '养老', '教育', '房价'
+        ]
 
-        # Check for international keywords
+        # International keywords
+        international_keywords = [
+            '欧洲', '美洲', '非洲', '大洋洲', '中东', '东南亚', '南亚', '拉美',
+            '美国', '韩国', '日本', '俄罗斯', '英国', '法国', '德国', '印度',
+            '八国', '七国', 'G7', 'G20', '联合国', '北约', '欧盟',
+            '特朗普', '拜登', '普京', '泽连斯基', '金正恩',
+            '战机', '空袭', '军事', '美军', '俄军', '关税', '贸易战', '制裁'
+        ]
+
+        # Calculate scores
+        tech_score = sum(1 for keyword in tech_keywords if keyword in content)
+        domestic_score = sum(1 for keyword in domestic_keywords if keyword in content)
         international_score = sum(1 for keyword in international_keywords if keyword in content)
 
-        # If international score is higher, classify as International
-        if international_score > domestic_score:
-            return 'International'
+        # Classify based on highest score
+        if tech_score > 0:
+            return '科技'
+        elif international_score > domestic_score:
+            return '国际'
         elif domestic_score > 0:
-            return 'Domestic'
+            return '国内'
 
-        # Default: keep original classification
         return None
 
     def remove_duplicates(self, news_list: List[Dict]) -> List[Dict]:
@@ -257,19 +256,21 @@ class EnhancedNewsAggregator:
             print(f"[WARNING] Could not enrich: {news_item['title'][:50]}...")
             return news_item
 
-    def balance_news_count(self, news_list: List[Dict], target_per_type: int = 10) -> List[Dict]:
-        """Balance news count to ensure equal distribution between Domestic and International"""
-        domestic_news = [n for n in news_list if n['source_type'] == 'Domestic']
-        international_news = [n for n in news_list if n['source_type'] == 'International']
+    def balance_news_count(self, news_list: List[Dict]) -> List[Dict]:
+        """Balance news count: 10 domestic, 10 international, 5 tech"""
+        domestic_news = [n for n in news_list if n['source_type'] == '国内']
+        international_news = [n for n in news_list if n['source_type'] == '国际']
+        tech_news = [n for n in news_list if n['source_type'] == '科技']
 
-        print(f"[INFO] Before balancing: {len(domestic_news)} domestic, {len(international_news)} international")
+        print(f"[INFO] Before balancing: {len(domestic_news)} 国内, {len(international_news)} 国际, {len(tech_news)} 科技")
 
-        # Take target number from each type
+        # Take specified number from each type
         balanced_news = []
-        balanced_news.extend(domestic_news[:target_per_type])
-        balanced_news.extend(international_news[:target_per_type])
+        balanced_news.extend(domestic_news[:10])
+        balanced_news.extend(international_news[:10])
+        balanced_news.extend(tech_news[:5])
 
-        print(f"[INFO] After balancing: {len([n for n in balanced_news if n['source_type'] == 'Domestic'])} domestic, {len([n for n in balanced_news if n['source_type'] == 'International'])} international")
+        print(f"[INFO] After balancing: {len([n for n in balanced_news if n['source_type'] == '国内'])} 国内, {len([n for n in balanced_news if n['source_type'] == '国际'])} 国际, {len([n for n in balanced_news if n['source_type'] == '科技'])} 科技")
 
         return balanced_news
 
@@ -289,8 +290,8 @@ class EnhancedNewsAggregator:
         # Remove duplicates based on title
         self.all_news = self.remove_duplicates(self.all_news)
 
-        # Balance news count to ensure equal distribution
-        self.all_news = self.balance_news_count(self.all_news, target_per_type=10)
+        # Balance news count to ensure proper distribution
+        self.all_news = self.balance_news_count(self.all_news)
 
         print(f"\n[OK] Total news items aggregated: {len(self.all_news)}\n")
         return self.all_news
@@ -327,8 +328,9 @@ class EnhancedNewsAggregator:
             for idx, news in enumerate(self.all_news, 1)
         ])
 
-        intl_count = len([n for n in self.all_news if n['source_type'] == 'International'])
-        domestic_count = len([n for n in self.all_news if n['source_type'] == 'Domestic'])
+        domestic_count = len([n for n in self.all_news if n['source_type'] == '国内'])
+        intl_count = len([n for n in self.all_news if n['source_type'] == '国际'])
+        tech_count = len([n for n in self.all_news if n['source_type'] == '科技'])
 
         html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -413,31 +415,13 @@ class EnhancedNewsAggregator:
             border-radius: 10px;
             box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             transition: transform 0.3s ease, box-shadow 0.3s ease;
-            display: flex;
-            flex-direction: row;
+            padding: 25px;
             overflow: hidden;
-            min-height: 150px;
         }}
 
         .news-item:hover {{
             transform: translateY(-3px);
             box-shadow: 0 10px 25px rgba(0,0,0,0.15);
-        }}
-
-        .news-left {{
-            flex: 0 0 40%;
-            padding: 25px;
-            display: flex;
-            flex-direction: column;
-            border-right: 1px solid #eee;
-        }}
-
-        .news-right {{
-            flex: 1;
-            padding: 25px;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
         }}
 
         .news-badge {{
@@ -458,6 +442,11 @@ class EnhancedNewsAggregator:
         .badge-domestic {{
             background: #f3e5f5;
             color: #7b1fa2;
+        }}
+
+        .badge-tech {{
+            background: #e8f5e9;
+            color: #388e3c;
         }}
 
         .news-title {{
@@ -564,12 +553,16 @@ class EnhancedNewsAggregator:
                     <div class="stat-label">总新闻数</div>
                 </div>
                 <div class="stat">
+                    <div class="stat-number">{domestic_count}</div>
+                    <div class="stat-label">国内新闻</div>
+                </div>
+                <div class="stat">
                     <div class="stat-number">{intl_count}</div>
                     <div class="stat-label">国际新闻</div>
                 </div>
                 <div class="stat">
-                    <div class="stat-number">{domestic_count}</div>
-                    <div class="stat-label">国内新闻</div>
+                    <div class="stat-number">{tech_count}</div>
+                    <div class="stat-label">科技新闻</div>
                 </div>
             </div>
         </div>
@@ -587,9 +580,9 @@ class EnhancedNewsAggregator:
         return html
 
     def _generate_news_card(self, news: Dict, index: int) -> str:
-        """Generate a single news card HTML with left-right layout"""
-        badge_class = 'badge-international' if news['source_type'] == 'International' else 'badge-domestic'
-        badge_text = '🌐 国际' if news['source_type'] == 'International' else '🏠 国内'
+        """Generate a single news card HTML with vertical layout"""
+        badge_class = 'badge-international' if news['source_type'] == '国际' else ('badge-tech' if news['source_type'] == '科技' else 'badge-domestic')
+        badge_text = '🌐 国际' if news['source_type'] == '国际' else ('💻 科技' if news['source_type'] == '科技' else '🏠 国内')
 
         # Get summary from description or detailed_content
         summary = news.get('description', '') or news.get('detailed_content', '') or '暂无简介'
@@ -602,18 +595,13 @@ class EnhancedNewsAggregator:
             image_html = f'<img src="{news["image"]}" alt="新闻配图" class="news-image" onerror="this.style.display=\'none\'">'
 
         return f"""<div class="news-item">
-            <div class="news-left">
-                <span class="news-badge {badge_class}">{badge_text}</span>
-                <h3 class="news-title">{news['title']}</h3>
-                <div class="news-meta">
-                    <span class="news-source">{news['source']}</span>
-                    <span class="news-date">{news['published_at'][:10] if news['published_at'] else '未知'}</span>
-                </div>
-            </div>
-            <div class="news-right">
-                {image_html}
-                <p class="news-summary">{summary}</p>
-                <a href="{news['url']}" target="_blank" class="news-link">阅读全文 →</a>
+            <span class="news-badge {badge_class}">{badge_text}</span>
+            <h3 class="news-title">{news['title']}</h3>
+            {image_html}
+            <p class="news-summary">{summary}</p>
+            <div class="news-meta">
+                <span class="news-source">{news['source']}</span>
+                <span class="news-date">{news['published_at'][:10] if news['published_at'] else '未知'}</span>
             </div>
         </div>"""
 
