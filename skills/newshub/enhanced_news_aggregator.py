@@ -26,22 +26,31 @@ class EnhancedNewsAggregator:
         """Extract original news source from title or description"""
         content = title + ' ' + description
 
-        # Common patterns for news sources
+        # Common patterns for news sources (ordered by priority)
         patterns = [
-            r'据([^报道消息讯]{2,6})报道',
-            r'([^报道消息讯]{2,6})消息',
-            r'([^报道消息讯]{2,6})讯',
-            r'来源[：:]\s*([^\s]{2,10})',
-            r'\(([^)]{2,6})\)$',  # Source in parentheses at end
+            r'【来源[：:]([^】]+)】',  # 【来源：xxx】
+            r'来源[：:]\s*([^\s\)）]{2,15})',  # 来源：xxx
+            r'（来源[：:]([^）]+)）',  # （来源：xxx）
+            r'\(来源[：:]([^)]+)\)',  # (来源：xxx)
+            r'据([^报道消息讯]{2,10})报道',  # 据xxx报道
+            r'([^报道消息讯]{2,10})消息',  # xxx消息
+            r'([^报道消息讯]{2,10})讯',  # xxx讯
+            r'([^报道消息讯]{2,10})报道',  # xxx报道
+            r'记者[^\s]{0,3}从([^获悉了解到]{2,10})',  # 记者从xxx获悉
+            r'\(([^)]{2,8})\)$',  # Source in parentheses at end
+            r'（([^）]{2,8})）$',  # Source in Chinese parentheses at end
         ]
 
         for pattern in patterns:
             match = re.search(pattern, content)
             if match:
                 source = match.group(1).strip()
-                # Filter out common non-source words
-                if source and len(source) >= 2 and source not in ['记者', '编辑', '本报', '本网']:
-                    return source
+                # Filter out common non-source words and aggregators
+                excluded_words = ['记者', '编辑', '本报', '本网', '中华网', '新浪', '搜狐', '网易', '腾讯']
+                if source and len(source) >= 2 and source not in excluded_words:
+                    # Additional check: avoid generic terms
+                    if not any(term in source for term in ['报道', '消息', '讯', '获悉', '了解']):
+                        return source
 
         return fallback_source
 
@@ -82,13 +91,13 @@ class EnhancedNewsAggregator:
         domestic_score = sum(1 for keyword in domestic_keywords if keyword in content)
         international_score = sum(1 for keyword in international_keywords if keyword in content)
 
-        # Classify based on highest score
+        # Classify based on highest score (prioritize domestic over international)
         if tech_score > 0:
             return '科技'
-        elif international_score > domestic_score:
-            return '国际'
-        elif domestic_score > 0:
+        elif domestic_score > 0 and domestic_score >= international_score:
             return '国内'
+        elif international_score > 0:
+            return '国际'
 
         return None
 
@@ -323,14 +332,54 @@ class EnhancedNewsAggregator:
         """Generate HTML content"""
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-        news_cards = '\n'.join([
+        # Group news by category
+        domestic_news = [n for n in self.all_news if n['source_type'] == '国内']
+        intl_news = [n for n in self.all_news if n['source_type'] == '国际']
+        tech_news = [n for n in self.all_news if n['source_type'] == '科技']
+
+        # Generate news cards for each category with separate numbering
+        domestic_cards = '\n'.join([
             self._generate_news_card(news, idx)
-            for idx, news in enumerate(self.all_news, 1)
+            for idx, news in enumerate(domestic_news, 1)
         ])
 
-        domestic_count = len([n for n in self.all_news if n['source_type'] == '国内'])
-        intl_count = len([n for n in self.all_news if n['source_type'] == '国际'])
-        tech_count = len([n for n in self.all_news if n['source_type'] == '科技'])
+        intl_cards = '\n'.join([
+            self._generate_news_card(news, idx)
+            for idx, news in enumerate(intl_news, 1)
+        ])
+
+        tech_cards = '\n'.join([
+            self._generate_news_card(news, idx)
+            for idx, news in enumerate(tech_news, 1)
+        ])
+
+        # Combine into categorized sections
+        news_cards = f"""
+            <div class="category-section">
+                <h2 class="category-title">🏠 国内新闻</h2>
+                <div class="news-grid">
+                    {domestic_cards}
+                </div>
+            </div>
+
+            <div class="category-section">
+                <h2 class="category-title">🌐 国际新闻</h2>
+                <div class="news-grid">
+                    {intl_cards}
+                </div>
+            </div>
+
+            <div class="category-section">
+                <h2 class="category-title">💻 科技新闻</h2>
+                <div class="news-grid">
+                    {tech_cards}
+                </div>
+            </div>
+        """
+
+        domestic_count = len(domestic_news)
+        intl_count = len(intl_news)
+        tech_count = len(tech_news)
 
         html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -401,6 +450,21 @@ class EnhancedNewsAggregator:
             color: #999;
             font-size: 0.9em;
             margin-top: 5px;
+        }}
+
+        .category-section {{
+            margin-bottom: 40px;
+        }}
+
+        .category-title {{
+            background: white;
+            padding: 20px 30px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            color: #333;
+            font-size: 1.8em;
+            font-weight: bold;
         }}
 
         .news-grid {{
@@ -584,10 +648,14 @@ class EnhancedNewsAggregator:
         badge_class = 'badge-international' if news['source_type'] == '国际' else ('badge-tech' if news['source_type'] == '科技' else 'badge-domestic')
         badge_text = '🌐 国际' if news['source_type'] == '国际' else ('💻 科技' if news['source_type'] == '科技' else '🏠 国内')
 
-        # Get summary from description or detailed_content
+        # Get summary from description or detailed_content (no truncation)
         summary = news.get('description', '') or news.get('detailed_content', '') or '暂无简介'
-        if summary and len(summary) > 300:
-            summary = summary[:300] + '...'
+
+        # Ensure summary ends with proper punctuation
+        if summary and summary != '暂无简介':
+            summary = summary.strip()
+            if summary and summary[-1] not in '。！？；，.!?;,':
+                summary += '。'
 
         # Generate image HTML if available
         image_html = ''
@@ -596,11 +664,11 @@ class EnhancedNewsAggregator:
 
         return f"""<div class="news-item">
             <span class="news-badge {badge_class}">{badge_text}</span>
-            <h3 class="news-title">{news['title']}</h3>
+            <h3 class="news-title">{index}、{news['title']}</h3>
             {image_html}
             <p class="news-summary">{summary}</p>
             <div class="news-meta">
-                <span class="news-source">{news['source']}</span>
+                <span class="news-source">来源：{news['source']}</span>
                 <span class="news-date">{news['published_at'][:10] if news['published_at'] else '未知'}</span>
             </div>
         </div>"""
