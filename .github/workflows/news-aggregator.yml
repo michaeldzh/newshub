@@ -32,28 +32,6 @@ jobs:
           {
             "news_sources": [
               {
-                "name": "NewsAPI-国际新闻",
-                "type": "国际",
-                "endpoint": "https://newsapi.org/v2/everything",
-                "auth_type": "api_key",
-                "params": {
-                  "apiKey": "${{ secrets.NEWSAPI_KEY }}",
-                  "q": "international OR world OR global OR foreign",
-                  "language": "en",
-                  "sortBy": "publishedAt",
-                  "pageSize": 30
-                },
-                "response_format": {
-                  "headlines_path": "articles",
-                  "title_field": "title",
-                  "description_field": "description",
-                  "url_field": "url",
-                  "image_field": "urlToImage",
-                  "source_field": "source.name",
-                  "published_at_field": "publishedAt"
-                }
-              },
-              {
                 "name": "天行数据-国内新闻",
                 "type": "国内",
                 "endpoint": "https://apis.tianapi.com/guonei/index",
