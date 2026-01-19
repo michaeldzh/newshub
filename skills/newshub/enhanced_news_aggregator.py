@@ -189,17 +189,14 @@ class EnhancedNewsAggregator:
     def enrich_with_web_search(self, news_item: Dict) -> Dict:
         """Enrich news item with detailed content from web page"""
         try:
-            # If description or image is missing, try to fetch from URL
-            if (not news_item['description'] or news_item['description'] == '暂无简介') or not news_item['image']:
+            # Only fetch description if missing, do NOT fetch images to avoid mismatches
+            if not news_item['description'] or news_item['description'] == '暂无简介':
                 if news_item['url']:
-                    desc, img = self.extract_content_from_url(news_item['url'])
+                    desc, _ = self.extract_content_from_url(news_item['url'])
 
-                    if desc and (not news_item['description'] or news_item['description'] == '暂无简介'):
+                    if desc:
                         news_item['description'] = desc
                         news_item['detailed_content'] = desc
-
-                    if img and not news_item['image']:
-                        news_item['image'] = img
 
             time.sleep(self.search_delay)  # Rate limiting
             return news_item
@@ -439,10 +436,11 @@ class EnhancedNewsAggregator:
 
         .news-image {{
             width: 100%;
-            max-height: 200px;
-            object-fit: cover;
+            max-height: 250px;
+            object-fit: contain;
             border-radius: 8px;
             margin-bottom: 15px;
+            background: #f5f5f5;
         }}
 
         .news-summary {{
