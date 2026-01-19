@@ -126,6 +126,63 @@ jobs:
                   "source_field": "source",
                   "published_at_field": "ctime"
                 }
+              },
+              {
+                "name": "天行数据-国际新闻",
+                "type": "International",
+                "endpoint": "https://apis.tianapi.com/world/index",
+                "auth_type": "api_key",
+                "params": {
+                  "key": "${{ secrets.TIANAPI_KEY }}",
+                  "num": 15
+                },
+                "response_format": {
+                  "headlines_path": "result.newslist",
+                  "title_field": "title",
+                  "description_field": "description",
+                  "url_field": "url",
+                  "image_field": "picUrl",
+                  "source_field": "source",
+                  "published_at_field": "ctime"
+                }
+              },
+              {
+                "name": "天行数据-AI新闻",
+                "type": "Domestic",
+                "endpoint": "https://apis.tianapi.com/ai/index",
+                "auth_type": "api_key",
+                "params": {
+                  "key": "${{ secrets.TIANAPI_KEY }}",
+                  "num": 10
+                },
+                "response_format": {
+                  "headlines_path": "result.newslist",
+                  "title_field": "title",
+                  "description_field": "description",
+                  "url_field": "url",
+                  "image_field": "picUrl",
+                  "source_field": "source",
+                  "published_at_field": "ctime"
+                }
+              },
+              {
+                "name": "天行数据-健康新闻",
+                "type": "Domestic",
+                "endpoint": "https://apis.tianapi.com/health/index",
+                "auth_type": "api_key",
+                "params": {
+                  "key": "${{ secrets.TIANAPI_KEY }}",
+                  "num": 10
+                },
+                "response_format": {
+                  "headlines_path": "result.newslist",
+                  "title_field": "title",
+                  "description_field": "description",
+                  "url_field": "url",
+                  "image_field": "picUrl",
+                  "source_field": "source",
+                  "published_at_field": "ctime"
+                }
               }
             ],
             "output": {
