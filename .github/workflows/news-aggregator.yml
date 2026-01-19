@@ -77,7 +77,45 @@ jobs:
                 "auth_type": "api_key",
                 "params": {
                   "key": "${{ secrets.TIANAPI_KEY }}",
-                  "num": 15
+                  "num": 10
+                },
+                "response_format": {
+                  "headlines_path": "result.newslist",
+                  "title_field": "title",
+                  "description_field": "description",
+                  "url_field": "url",
+                  "image_field": "picUrl",
+                  "source_field": "source",
+                  "published_at_field": "ctime"
+                }
+              },
+              {
+                "name": "天行数据-科技新闻",
+                "type": "Domestic",
+                "endpoint": "https://apis.tianapi.com/keji/index",
+                "auth_type": "api_key",
+                "params": {
+                  "key": "${{ secrets.TIANAPI_KEY }}",
+                  "num": 10
+                },
+                "response_format": {
+                  "headlines_path": "result.newslist",
+                  "title_field": "title",
+                  "description_field": "description",
+                  "url_field": "url",
+                  "image_field": "picUrl",
+                  "source_field": "source",
+                  "published_at_field": "ctime"
+                }
+              },
+              {
+                "name": "天行数据-财经新闻",
+                "type": "Domestic",
+                "endpoint": "https://apis.tianapi.com/caijing/index",
+                "auth_type": "api_key",
+                "params": {
+                  "key": "${{ secrets.TIANAPI_KEY }}",
+                  "num": 10
                 },
                 "response_format": {
                   "headlines_path": "result.newslist",
