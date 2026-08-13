@@ -19,9 +19,9 @@ import re
 import requests
 from datetime import datetime, timezone, timedelta
 
-MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-5-20250929"
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
 OUTPUT = os.environ.get("REPORT_PATH", "index.html")
 
 SYSTEM_PROMPT = (
