@@ -26,6 +26,19 @@ API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
 MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-5-20250929"
 
+# 兼容不同网关的路径写法：
+#   - 直接给完整接口地址：ANTHROPIC_MESSAGES_ENDPOINT（最高优先级）
+#   - BASE_URL 已含 /v1 或 /messages 时不再重复拼接，避免 /v1/v1/messages
+_endpoint_override = os.environ.get("ANTHROPIC_MESSAGES_ENDPOINT")
+if _endpoint_override:
+    ENDPOINT = _endpoint_override.rstrip("/")
+elif BASE_URL.endswith("/messages"):
+    ENDPOINT = BASE_URL
+elif BASE_URL.endswith("/v1"):
+    ENDPOINT = BASE_URL + "/messages"
+else:
+    ENDPOINT = BASE_URL + "/v1/messages"
+
 if not API_KEY:
     raise SystemExit("ERROR: 环境变量 ANTHROPIC_API_KEY 未设置")
 
@@ -63,7 +76,7 @@ WS_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 24}
 
 def call_api(messages):
     resp = requests.post(
-        f"{BASE_URL}/v1/messages",
+        f"{ENDPOINT}",
         headers={
             "x-api-key": API_KEY,
             "anthropic-version": "2023-06-01",
