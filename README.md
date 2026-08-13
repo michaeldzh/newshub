@@ -1,54 +1,41 @@
-# 🤖 NewsHub - AI 资讯日报
+# newshub · 每日 AI 资讯日报
 
-每天定时搜索过去 24 小时全球 AI 领域的重要动态，筛选 20 条有价值的国内外资讯，
-生成 HTML 报告并通过 163 邮箱推送到你的收件箱。
+一个自包含的 GitHub 仓库 Skill：**每天自动检索过去 24 小时全球 AI 动态，筛选 20 条有价值的中外信息，推送至 163 邮箱**。
 
-## ✨ 特性
+> 本仓库已完全替换原 newshub 项目，与旧的 Claude Agent SDK / 天行数据聚合无任何关系。
 
-- 🔍 **Claude 联网搜索**：使用 Claude API（web_search 工具）实时检索全球 AI 资讯
-- 📰 **20 条精选**：覆盖 AI 技术 / AI 应用 / AI 行业，国内外混合，多源去重
-- ⏰ **自动定时**：GitHub Actions 每天定时生成并推送
-- 📧 **邮箱推送**：报告以 HTML 正文 + 附件形式发送到 163 邮箱
-- 🔐 **密钥安全**：所有授权码 / API Key 均通过 GitHub Secrets（环境变量）注入，不落盘
+## 结构
+```
+skills/newshub/
+  generate.py         # 联网检索 + 生成 AI资讯24小时_YYYY年M月D日.md / index.html
+  push_email.py       # 经 163 SMTP 推送最新报告（HTML 正文 + 附件）
+  requirements.txt
+  SKILL.md
+.github/workflows/    # 定时调度（见下）
+```
 
-## 🚀 快速开始
+## 报告内容
+每条资讯包含：**标题 / 摘要 / 发布日期 / 来源 / 原文链接**，分「AI 技术 / AI 应用 / AI 行业动态」三栏，合计 20 条。
 
-在仓库 **Settings → Secrets and variables → Actions** 中添加：
+## 定时运行
+由 GitHub Actions 每天 **北京时间 08:00** 触发（`.github/workflows/ai-news.yml`），也可在 Actions 页手动 `Run workflow` 立即测试。
 
+## 密钥（全部走 Secrets，零硬编码）
 | Secret | 必填 | 说明 |
-|--------|------|------|
-| `ANTHROPIC_API_KEY` | 是 | Claude API Key（生成报告用） |
-| `ANTHROPIC_BASE_URL` | 否 | 自定义 API 网关 |
-| `ANTHROPIC_MODEL` | 否 | 模型（默认 claude-sonnet-4-5） |
-| `NEWS_SMTP_AUTH` | 是 | 163 邮箱客户端授权码 |
-| `NEWS_SMTP_TO` | 否 | 收件邮箱（默认 newshub01@163.com） |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | 是 | 生成报告用 |
+| `ANTHROPIC_BASE_URL` | 否 | 默认 https://api.anthropic.com |
+| `ANTHROPIC_MODEL` | 否 | 模型名 |
+| `NEWS_SMTP_AUTH` | 是 | 163 邮箱授权码 |
+| `NEWS_SMTP_USER` | 否 | 默认 newshub01@163.com |
+| `NEWS_SMTP_TO` | 否 | 默认 newshub01@163.com |
 
-## 📁 项目结构
-
-```
-newshub/
-├── .github/
-│   └── workflows/
-│       └── news-aggregator.yml    # 定时工作流（生成 + 推送）
-├── skills/
-│   └── newshub/
-│       ├── generate_ai_news.py     # Claude 联网搜索生成 AI 资讯报告
-│       ├── push_email.py           # 163 邮箱推送
-│       └── requirements.txt        # Python 依赖
-└── README.md
-```
-
-## 🔧 本地运行
-
+## 本地手动运行
 ```bash
+pip install -r skills/newshub/requirements.txt
 cd skills/newshub
-pip install -r requirements.txt
-export ANTHROPIC_API_KEY="..."
-export NEWS_SMTP_AUTH="..."
-python generate_ai_news.py
-python push_email.py index.html
+export ANTHROPIC_API_KEY=xxx
+python generate.py
+export NEWS_SMTP_AUTH=xxxx
+python push_email.py
 ```
-
-## 📄 许可证
-
-MIT License
