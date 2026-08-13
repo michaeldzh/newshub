@@ -1,38 +1,27 @@
-# 🌍 NewsHub - 全球新闻聚合器
+# 🤖 NewsHub - AI 资讯日报
 
-自动聚合国际和国内新闻，使用 Claude Agent SDK 智能生成每日新闻报告。
+每天定时搜索过去 24 小时全球 AI 领域的重要动态，筛选 20 条有价值的国内外资讯，
+生成 HTML 报告并通过 163 邮箱推送到你的收件箱。
 
 ## ✨ 特性
 
-- 🤖 **Claude AI 驱动**：使用 Claude Agent SDK 智能执行任务
-- 🌐 **双源新闻**：聚合国际（NewsAPI）和国内（天行数据）新闻
-- ⏰ **自动定时**：每天自动生成最新新闻报告
-- 📱 **响应式设计**：左右分栏布局，移动端自适应
-- 🚀 **GitHub Pages**：自动部署到 GitHub Pages
+- 🔍 **Claude 联网搜索**：使用 Claude API（web_search 工具）实时检索全球 AI 资讯
+- 📰 **20 条精选**：覆盖 AI 技术 / AI 应用 / AI 行业，国内外混合，多源去重
+- ⏰ **自动定时**：GitHub Actions 每天定时生成并推送
+- 📧 **邮箱推送**：报告以 HTML 正文 + 附件形式发送到 163 邮箱
+- 🔐 **密钥安全**：所有授权码 / API Key 均通过 GitHub Secrets（环境变量）注入，不落盘
 
 ## 🚀 快速开始
 
-### 1. 配置 GitHub Secrets
+在仓库 **Settings → Secrets and variables → Actions** 中添加：
 
-在仓库设置中添加以下 Secrets：
-
-| Secret 名称 | 说明 |
-|------------|------|
-| `ANTHROPIC_API_KEY` | Claude API 密钥 |
-| `ANTHROPIC_BASE_URL` | Claude API 端点 |
-| `NEWSAPI_KEY` | NewsAPI 密钥 |
-| `TIANAPI_KEY` | 天行数据密钥 |
-
-### 2. 启用 GitHub Pages
-
-1. 进入仓库 Settings → Pages
-2. Source 选择 `gh-pages` 分支
-3. 保存设置
-
-### 3. 运行 Workflow
-
-- 自动运行：每天 UTC 0:00（北京时间 8:00）
-- 手动运行：Actions → Daily News Aggregator → Run workflow
+| Secret | 必填 | 说明 |
+|--------|------|------|
+| `ANTHROPIC_API_KEY` | 是 | Claude API Key（生成报告用） |
+| `ANTHROPIC_BASE_URL` | 否 | 自定义 API 网关 |
+| `ANTHROPIC_MODEL` | 否 | 模型（默认 claude-sonnet-4-5） |
+| `NEWS_SMTP_AUTH` | 是 | 163 邮箱客户端授权码 |
+| `NEWS_SMTP_TO` | 否 | 收件邮箱（默认 newshub01@163.com） |
 
 ## 📁 项目结构
 
@@ -40,56 +29,26 @@
 newshub/
 ├── .github/
 │   └── workflows/
-│       └── news-aggregator.yml    # GitHub Actions 工作流
+│       └── news-aggregator.yml    # 定时工作流（生成 + 推送）
 ├── skills/
 │   └── newshub/
-│       ├── enhanced_news_aggregator.py  # 新闻聚合脚本
-│       ├── run_with_claude.py           # Claude Agent 脚本
-│       ├── requirements.txt             # Python 依赖
-│       └── api-config.example.json      # API 配置模板
+│       ├── generate_ai_news.py     # Claude 联网搜索生成 AI 资讯报告
+│       ├── push_email.py           # 163 邮箱推送
+│       └── requirements.txt        # Python 依赖
 └── README.md
 ```
 
-## 🔧 本地开发
-
-### 安装依赖
+## 🔧 本地运行
 
 ```bash
 cd skills/newshub
 pip install -r requirements.txt
+export ANTHROPIC_API_KEY="..."
+export NEWS_SMTP_AUTH="..."
+python generate_ai_news.py
+python push_email.py index.html
 ```
-
-### 配置 API
-
-复制配置模板并填入你的 API 密钥：
-
-```bash
-cp api-config.example.json api-config.json
-# 编辑 api-config.json，填入真实的 API 密钥
-```
-
-### 运行脚本
-
-```bash
-# 方式 1：直接运行聚合脚本
-python enhanced_news_aggregator.py api-config.json
-
-# 方式 2：使用 Claude Agent
-export ANTHROPIC_API_KEY="your-api-key"
-export ANTHROPIC_BASE_URL="your-api-endpoint"
-python run_with_claude.py
-```
-
-## 📊 使用的 API
-
-- **NewsAPI**：国际新闻源 - https://newsapi.org
-- **天行数据**：国内新闻源 - https://www.tianapi.com
-- **Claude API**：AI 智能执行 - https://www.anthropic.com
 
 ## 📄 许可证
 
 MIT License
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
