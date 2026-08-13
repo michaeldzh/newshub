@@ -4,7 +4,7 @@
 每日 AI 资讯生成器（仓库内自包含版本，OpenAI 兼容网关 + 解耦搜索）
 
 - 通过可配置的搜索源检索「过去 24 小时」全球 AI 动态：
-    Tavily（设 TAVILY_API_KEY 时优先） -> 否则 keyless DuckDuckGo 退化方案
+    Tavily（设 TAVILY_API_KEY 时优先） -> 否则免 key 的 Google News RSS + Hacker News -> 最后 DDG 兜底
 - 将检索结果作为上下文交给 LLM（OpenAI Chat Completions 格式）总结，
   生成 20 条结构化资讯（技术 / 应用 / 行业，侧重技术与应用）
 - 输出 Markdown: AI资讯24小时_YYYY年M月D日.md 与 index.html
@@ -50,32 +50,86 @@ QUERIES = [
 ]
 
 
+def _req_json(url, headers=None, timeout=25):
+    try:
+        r = requests.get(url, headers=headers or {}, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print("req_json error:", e)
+    return None
+
+
 def search_tavily(query, max_results=5):
+    """优先：Tavily（需 TAVILY_API_KEY，由 workflow 传入；未传入则跳过）。"""
     key = os.environ.get("TAVILY_API_KEY")
     if not key:
         return None
+    data = _req_json(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        timeout=30,
+    )
+    if not data:
+        return None
+    out = []
+    for it in data.get("results", []):
+        out.append({
+            "title": it.get("title", ""),
+            "url": it.get("url", ""),
+            "content": (it.get("content") or "")[:600],
+            "published": it.get("published_date", ""),
+        })
+    return out
+
+
+def search_gnews(query, max_results=5):
+    """免 key 兜底：Google News RSS（覆盖中英文全球新闻）。"""
     try:
-        r = requests.post(
-            "https://api.tavily.com/search",
-            json={"query": query, "max_results": max_results,
-                  "topic": "news", "days": 1},
-            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-            timeout=30,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            out = []
-            for it in data.get("results", []):
-                out.append({
-                    "title": it.get("title", ""),
-                    "url": it.get("url", ""),
-                    "content": (it.get("content") or "")[:600],
-                    "published": it.get("published_date", ""),
-                })
-            return out
+        from urllib.parse import quote
+        url = ("https://news.google.com/rss/search?q=%s&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+               % quote(query))
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+        if r.status_code != 200:
+            return []
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(r.content)
+        out = []
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "").strip()
+            if link and title:
+                out.append({"title": title, "url": link, "content": title, "published": pub})
+            if len(out) >= max_results:
+                break
+        return out
     except Exception as e:
-        print("Tavily error:", e)
-    return None
+        print("GNews error:", e)
+        return []
+
+
+def search_hn(query, max_results=5):
+    """免 key 兜底：Hacker News Algolia（技术深度好）。"""
+    from urllib.parse import quote
+    data = _req_json(
+        "https://hn.algolia.com/api/v1/search?query=%s&tags=story&hitsPerPage=%d"
+        % (quote(query), max_results),
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    if not data:
+        return []
+    out = []
+    for h in data.get("hits", []):
+        oid = h.get("objectID", "")
+        url = h.get("url") or ("https://news.ycombinator.com/item?id=%s" % oid)
+        out.append({
+            "title": h.get("title", ""),
+            "url": url,
+            "content": (h.get("story_text") or "")[:400] or h.get("title", ""),
+            "published": h.get("created_at", ""),
+        })
+    return out
 
 
 def search_ddg(query, max_results=5):
@@ -109,7 +163,8 @@ def gather():
     all_res = []
     seen = set()
     for q in QUERIES:
-        res = search_tavily(q) or search_ddg(q)
+        # Tavily(有 key) -> Google News + HN(免 key) -> DDG(最后兜底)
+        res = search_tavily(q) or (search_gnews(q) + search_hn(q)) or search_ddg(q)
         n = 0
         for it in (res or []):
             if it.get("url") and it["url"] not in seen:
