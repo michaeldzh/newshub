@@ -3,24 +3,24 @@
 """
 每日 AI 资讯生成器（仓库内自包含版本，OpenAI 兼容网关 + 解耦搜索）
 
-- 通过可配置的搜索源检索「过去 24 小时」全球 AI 动态：
-    Tavily（设 TAVILY_API_KEY 时优先） -> 否则免 key 的 Google News RSS + Hacker News -> 最后 DDG 兜底
-- 将检索结果作为上下文交给 LLM（OpenAI Chat Completions 格式）总结，
-  生成 20 条结构化资讯（技术 / 应用 / 行业，侧重技术与应用）
-- 输出 Markdown: AI资讯24小时_YYYY年M月D日.md 与 index.html
-- 密钥全走环境变量 / Secrets，不硬编码
+检索策略（解耦，不依赖单一来源）：
+  1) 直连 RSS：厂商官网 + 中英文主流科技媒体的直接 RSS（来源多样、链接真实）
+  2) 关键词检索补充：Tavily(设 TAVILY_API_KEY 时) -> 免 key 的 Google News RSS + Hacker News -> DDG 兜底
+将检索结果交给 LLM（OpenAI Chat Completions 格式）总结，生成 20 条结构化资讯。
+输出 Markdown: AI资讯24小时_YYYY年M月D日.md 与 index.html（紧凑排版，正文 200–300 字）。
+密钥全走环境变量 / Secrets，不硬编码。
 
 环境变量：
   ANTHROPIC_API_KEY   必填，LLM 网关 Bearer key（对 agnes 即用其 key）
   ANTHROPIC_BASE_URL  必填，网关基址，如 https://api.agnes-ai.cn/v1
   ANTHROPIC_MODEL     模型名，默认 agnes-2.0-flash
-  TAVILY_API_KEY      可选，搜索源；不填则退化为 keyless DuckDuckGo
+  TAVILY_API_KEY      可选，搜索源；不填则退化为免 key 检索
 """
 
 import os
 import re
 import datetime
-import html as _html
+import xml.etree.ElementTree as ET
 import requests
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -37,6 +37,37 @@ DATE = datetime.date.today()
 DATE_STR = f"{DATE.year}年{DATE.month}月{DATE.day}日"
 OUT_MD = f"AI资讯24小时_{DATE_STR}.md"
 
+# ── 多样化直连 RSS（厂商官网 + 中英文主流科技媒体）──────────────────────
+FEEDS = [
+    # 国际厂商 / 媒体
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "https://venturebeat.com/category/ai/feed/",
+    "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
+    "https://arstechnica.com/ai/feed/",
+    "https://www.wired.com/feed/tag/ai/latest/rss",
+    "https://www.zdnet.com/topic/artificial-intelligence/rss.xml",
+    "https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss",
+    "https://www.technologyreview.com/topic/artificial-intelligence/feed",
+    "https://blog.google/technology/ai/rss/",
+    "https://openai.com/blog/rss.xml",
+    "https://www.anthropic.com/news/rss.xml",
+    "https://blogs.nvidia.com/feed/",
+    "https://deepmind.google/blog/rss.xml",
+    "https://ai.meta.com/blog/rss.xml",
+    "https://blogs.microsoft.com/ai/feed/",
+    "https://huggingface.co/blog/feed.xml",
+    "https://rss.arxiv.org/rss/cs.AI",
+    "https://rss.arxiv.org/rss/cs.CL",
+    # 国内媒体
+    "https://www.qbitai.com/feed",
+    "https://36kr.com/feed",
+    "https://www.ithome.com/rss/",
+    "https://www.zhidx.com/rss.html",
+    "https://www.tmtpost.com/rss.xml",
+    "https://www.aibase.com/zh/ai-news/rss",
+]
+
+# 关键词检索补充（中文 + 英文，覆盖厂商与细分方向）
 QUERIES = [
     "AI artificial intelligence news today",
     "OpenAI Anthropic Google DeepMind NVIDIA latest announcement",
@@ -44,7 +75,6 @@ QUERIES = [
     "AI agent coding assistant news",
     "人工智能 大模型 最新动态 今日",
     "字节跳动 阿里 腾讯 百度 大模型 最新发布",
-    "AI application industry funding August 2026",
     "AI chip semiconductor news 2026",
     "machine learning research breakthrough this week",
 ]
@@ -58,6 +88,38 @@ def _req_json(url, headers=None, timeout=25):
     except Exception as e:
         print("req_json error:", e)
     return None
+
+
+def fetch_feed(url, max_items=3):
+    """通用 RSS/Atom 解析（直连来源，免 key）。失败静默返回空。"""
+    try:
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+        if r.status_code != 200:
+            return []
+        text = re.sub(r'\sxmlns(:\w+)?="[^"]+"', " ", r.text)
+        root = ET.fromstring(text)
+        nodes = root.findall(".//item") or root.findall(".//entry")
+        out = []
+        for node in nodes:
+            title = (node.findtext("title") or "").strip()
+            link_el = node.find("link")
+            link = ((link_el.get("href") if link_el is not None else None) or
+                    (link_el.text if link_el is not None else "") or "").strip()
+            pub = (node.findtext("pubDate") or node.findtext("published") or
+                   node.findtext("updated") or "").strip()
+            desc = (node.findtext("description") or node.findtext("summary") or
+                    node.findtext("content") or "")
+            desc = re.sub(r"<.*?>", " ", desc or "")
+            desc = re.sub(r"\s+", " ", desc).strip()[:400]
+            if title and link:
+                out.append({"title": title, "url": link,
+                            "content": desc or title, "published": pub})
+            if len(out) >= max_items:
+                break
+        return out
+    except Exception as e:
+        print(f"feed error {url[:50]}: {e}")
+        return []
 
 
 def search_tavily(query, max_results=5):
@@ -92,7 +154,6 @@ def search_gnews(query, max_results=5):
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
         if r.status_code != 200:
             return []
-        import xml.etree.ElementTree as ET
         root = ET.fromstring(r.content)
         out = []
         for item in root.iter("item"):
@@ -162,8 +223,15 @@ def search_ddg(query, max_results=5):
 def gather():
     all_res = []
     seen = set()
+    # 1) 直连 RSS（多样化来源）
+    for url in FEEDS:
+        for it in fetch_feed(url):
+            if it.get("url") and it["url"] not in seen:
+                seen.add(it["url"])
+                all_res.append(it)
+    print(f"feeds -> {len(all_res)} 条素材")
+    # 2) 关键词检索补充
     for q in QUERIES:
-        # Tavily(有 key) -> Google News + HN(免 key) -> DDG(最后兜底)
         res = search_tavily(q) or (search_gnews(q) + search_hn(q)) or search_ddg(q)
         n = 0
         for it in (res or []):
@@ -172,7 +240,8 @@ def gather():
                 all_res.append(it)
                 n += 1
         print(f"query={q!r} -> {n} new results")
-    return all_res
+    # 控制上下文体量
+    return all_res[:100]
 
 
 def build_context(results):
@@ -186,28 +255,30 @@ def build_context(results):
     return "\n".join(lines)
 
 
-PROMPT = """你是资深 AI 资讯编辑。下面是我检索到的「过去 24 小时」全球 AI 动态素材（含来源链接）。
-请筛选 20 条最有价值的国内外信息（覆盖 AI 技术、AI 应用、AI 行业动态，侧重技术与应用），避免重复与低质软文。
-每条必须包含：标题、摘要、发布日期、来源、原文链接。
-按「一、AI 技术 / 二、AI 应用 / 三、AI 行业动态」三栏组织（合计 20 条）。
-直接输出 Markdown 正文（从一级标题开始），不要额外解释或前言。
+PROMPT = """你是资深 AI 资讯编辑。下面是我从「厂商官网 + 中英文主流科技媒体」直接抓取的「过去 24 小时」全球 AI 动态素材（含真实原文链接）。
+请筛选 20 条最有价值的国内外信息，覆盖：一、AI 技术；二、AI 应用；三、AI 行业动态（侧重技术与应用），避免重复与低质软文。
+
+【每条输出格式，务必紧凑】
+### 序号. 标题
+> 来源：真实媒体/厂商名（如 OpenAI、机器之心、TechCrunch、NVIDIA Blog，严禁写“Google News”） · 发布日期（YYYY-MM-DD，无则写“近日”） · [原文](真实链接)
+（引用块之后另起一段）正文：用中文客观陈述该动态的要点、关键数据（型号/参数/金额/人名）与行业影响，200–300 字，不要空话套话，不要分点罗列。
+
+【整体要求】
+- 按三个二级标题分区，合计 20 条（每区条数自定，但合计须为 20）。
+- 直接输出 Markdown（从一级标题开始），不要前言、不要额外解释。
+- 素材中链接若是聚合页/跳转页，请尽量保留其指向的原始报道链接；若只有聚合链接也接受。
 
 素材：
 __CONTEXT__
 
-输出示例结构：
+输出示例：
 # AI 资讯 24 小时 | __DATE__
+> 今日 20 条 · 来源覆盖厂商官网与中英文科技媒体
+
 ## 一、AI 技术
 ### 1. 标题
-- 摘要：……
-- 发布日期：2026-08-13
-- 来源：OpenAI
-- 原文链接：https://……
-（其余条目同）
-## 二、AI 应用
-……
-## 三、AI 行业动态
-……
+> 来源：OpenAI · 2026-08-13 · [原文](https://...)
+正文内容 200–300 字……
 """
 
 
@@ -245,6 +316,8 @@ def md_to_html(md, date_str):
             if in_list:
                 out.append("</ul>"); in_list = False
             out.append(f"<h1>{inline(s[2:])}</h1>")
+        elif s.startswith("> "):
+            out.append(f"<blockquote>{inline(s[2:].strip())}</blockquote>")
         elif s.startswith("- "):
             if not in_list:
                 out.append("<ul>"); in_list = True
@@ -252,7 +325,7 @@ def md_to_html(md, date_str):
         elif s == "":
             if in_list:
                 out.append("</ul>"); in_list = False
-            out.append("<br>")
+            # 紧凑：不额外加 <br>
         else:
             if in_list:
                 out.append("</ul>"); in_list = False
@@ -265,12 +338,15 @@ def md_to_html(md, date_str):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI 资讯 24 小时 | {date_str}</title>
 <style>
-body{{font-family:-apple-system,'Microsoft YaHei',sans-serif;max-width:860px;margin:0 auto;padding:24px;line-height:1.7;color:#1f2328}}
-h1{{font-size:26px;border-bottom:3px solid #2d6cdf;padding-bottom:8px}}
-h2{{font-size:21px;margin-top:28px;color:#2d6cdf}}
-h3{{font-size:17px;margin-top:18px}}
-ul{{background:#f7f9fc;border-left:4px solid #2d6cdf;padding:10px 22px}}
-a{{color:#2d6cdf}}
+body{{font-family:-apple-system,'Microsoft YaHei',sans-serif;max-width:820px;margin:0 auto;padding:16px;line-height:1.6;color:#1f2328;font-size:15px}}
+h1{{font-size:23px;margin:0 0 10px;border-bottom:3px solid #2d6cdf;padding-bottom:6px}}
+h2{{font-size:18px;margin:20px 0 4px;color:#2d6cdf}}
+h3{{font-size:15.5px;margin:14px 0 2px;line-height:1.35}}
+blockquote{{margin:2px 0 6px;padding:4px 10px;background:#f4f7fb;border-left:3px solid #9db8e8;color:#5a6472;font-size:13px}}
+p{{margin:4px 0 10px}}
+a{{color:#2d6cdf;text-decoration:none}}
+ul{{background:#f7f9fc;border-left:4px solid #2d6cdf;padding:8px 18px;margin:6px 0}}
+li{{margin:3px 0}}
 </style></head><body>{body}</body></html>"""
 
 
