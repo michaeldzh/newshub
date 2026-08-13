@@ -1,63 +1,146 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日 AI 资讯生成器（仓库内自包含版本）
+每日 AI 资讯生成器（仓库内自包含版本，OpenAI 兼容网关 + 解耦搜索）
 
-- 通过 Anthropic Messages API + web_search 工具联网检索「过去 24 小时」全球 AI 动态
-- 筛选 20 条有价值的中外信息（技术 / 应用 / 行业，侧重技术与应用）
+- 通过可配置的搜索源检索「过去 24 小时」全球 AI 动态：
+    Tavily（设 TAVILY_API_KEY 时优先） -> 否则 keyless DuckDuckGo 退化方案
+- 将检索结果作为上下文交给 LLM（OpenAI Chat Completions 格式）总结，
+  生成 20 条结构化资讯（技术 / 应用 / 行业，侧重技术与应用）
 - 输出 Markdown: AI资讯24小时_YYYY年M月D日.md 与 index.html
-- 所有密钥经环境变量注入，不硬编码
+- 密钥全走环境变量 / Secrets，不硬编码
 
 环境变量：
-  ANTHROPIC_API_KEY   必填，调用方注入（仓库 Secrets）
-  ANTHROPIC_BASE_URL  可选，自定义 API 网关，默认 https://api.anthropic.com
-  ANTHROPIC_MODEL     可选，模型名，默认 claude-sonnet-4-5-20250929
+  ANTHROPIC_API_KEY   必填，LLM 网关 Bearer key（对 agnes 即用其 key）
+  ANTHROPIC_BASE_URL  必填，网关基址，如 https://api.agnes-ai.cn/v1
+  ANTHROPIC_MODEL     模型名，默认 agnes-2.0-flash
+  TAVILY_API_KEY      可选，搜索源；不填则退化为 keyless DuckDuckGo
 """
 
 import os
 import re
-import json
-import base64
 import datetime
 import html as _html
 import requests
 
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
-MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-4-5-20250929"
-
-# 兼容不同网关的路径写法：
-#   - 直接给完整接口地址：ANTHROPIC_MESSAGES_ENDPOINT（最高优先级）
-#   - BASE_URL 已含 /v1 或 /messages 时不再重复拼接，避免 /v1/v1/messages
-_endpoint_override = os.environ.get("ANTHROPIC_MESSAGES_ENDPOINT")
-if _endpoint_override:
-    ENDPOINT = _endpoint_override.rstrip("/")
-elif BASE_URL.endswith("/messages"):
-    ENDPOINT = BASE_URL
-elif BASE_URL.endswith("/v1"):
-    ENDPOINT = BASE_URL + "/messages"
-else:
-    ENDPOINT = BASE_URL + "/v1/messages"
+BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.agnes-ai.cn/v1").rstrip("/")
+MODEL = os.environ.get("ANTHROPIC_MODEL") or "agnes-2.0-flash"
+CHAT_ENDPOINT = BASE_URL + "/chat/completions"
 
 if not API_KEY:
     raise SystemExit("ERROR: 环境变量 ANTHROPIC_API_KEY 未设置")
+if not BASE_URL:
+    raise SystemExit("ERROR: 环境变量 ANTHROPIC_BASE_URL 未设置")
 
 DATE = datetime.date.today()
 DATE_STR = f"{DATE.year}年{DATE.month}月{DATE.day}日"
 OUT_MD = f"AI资讯24小时_{DATE_STR}.md"
 
-PROMPT = f"""你是资深 AI 资讯编辑。请使用 web_search 工具，检索「过去 24 小时」之内全球 AI 领域的重要动态，
-覆盖 AI 技术、AI 应用、AI 行业动态，侧重技术和应用。
+QUERIES = [
+    "AI artificial intelligence news today",
+    "OpenAI Anthropic Google DeepMind NVIDIA latest announcement",
+    "large language model release August 2026",
+    "AI agent coding assistant news",
+    "人工智能 大模型 最新动态 今日",
+    "字节跳动 阿里 腾讯 百度 大模型 最新发布",
+    "AI application industry funding August 2026",
+    "AI chip semiconductor news 2026",
+    "machine learning research breakthrough this week",
+]
 
-要求：
-1. 尽量多渠道：厂商官网（OpenAI、Google DeepMind、Anthropic、Meta、NVIDIA、字节跳动、阿里、DeepSeek、腾讯等）与主流科技媒体（TechCrunch、The Verge、VentureBeat、机器之心、量子位等）。
-2. 筛选 20 条有价值的国内外信息，避免重复与低质软文。
-3. 每条信息必须包含：标题、摘要、发布日期、来源、原文链接。
-4. 按「一、AI 技术 / 二、AI 应用 / 三、AI 行业动态」三栏组织（每栏若干条，合计 20 条）。
-5. 直接输出 Markdown 正文（从一级标题开始），不要额外解释或前言。
+
+def search_tavily(query, max_results=5):
+    key = os.environ.get("TAVILY_API_KEY")
+    if not key:
+        return None
+    try:
+        r = requests.post(
+            "https://api.tavily.com/search",
+            json={"api_key": key, "query": query, "max_results": max_results,
+                  "topic": "news", "days": 1},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            out = []
+            for it in data.get("results", []):
+                out.append({
+                    "title": it.get("title", ""),
+                    "url": it.get("url", ""),
+                    "content": (it.get("content") or "")[:600],
+                    "published": it.get("published_date", ""),
+                })
+            return out
+    except Exception as e:
+        print("Tavily error:", e)
+    return None
+
+
+def search_ddg(query, max_results=5):
+    try:
+        r = requests.post(
+            "https://lite.duckduckgo.com/lite/",
+            data={"q": query},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=25,
+        )
+        if r.status_code != 200:
+            return []
+        text = r.text
+        titles = re.findall(r'class="result-link"[^>]*>(.*?)</a>', text, re.S)
+        urls = re.findall(r'class="result-link"[^>]*href="(.*?)"', text)
+        snippets = re.findall(r'class="result-snippet">(.*?)</td>', text, re.S)
+        results = []
+        for i in range(min(max_results, len(titles))):
+            url = urls[i] if i < len(urls) else ""
+            title = re.sub(r"<.*?>", "", titles[i]).strip()
+            snippet = re.sub(r"<.*?>", "", snippets[i]).strip() if i < len(snippets) else ""
+            if url and url.startswith("http"):
+                results.append({"title": title, "url": url, "content": snippet, "published": ""})
+        return results
+    except Exception as e:
+        print("DDG error:", e)
+        return []
+
+
+def gather():
+    all_res = []
+    seen = set()
+    for q in QUERIES:
+        res = search_tavily(q) or search_ddg(q)
+        n = 0
+        for it in (res or []):
+            if it.get("url") and it["url"] not in seen:
+                seen.add(it["url"])
+                all_res.append(it)
+                n += 1
+        print(f"query={q!r} -> {n} new results")
+    return all_res
+
+
+def build_context(results):
+    lines = []
+    for i, it in enumerate(results, 1):
+        lines.append(
+            f"[{i}] 标题：{it.get('title', '')}\n"
+            f"链接：{it.get('url', '')}\n"
+            f"摘要：{it.get('content', '')}\n"
+        )
+    return "\n".join(lines)
+
+
+PROMPT = """你是资深 AI 资讯编辑。下面是我检索到的「过去 24 小时」全球 AI 动态素材（含来源链接）。
+请筛选 20 条最有价值的国内外信息（覆盖 AI 技术、AI 应用、AI 行业动态，侧重技术与应用），避免重复与低质软文。
+每条必须包含：标题、摘要、发布日期、来源、原文链接。
+按「一、AI 技术 / 二、AI 应用 / 三、AI 行业动态」三栏组织（合计 20 条）。
+直接输出 Markdown 正文（从一级标题开始），不要额外解释或前言。
+
+素材：
+__CONTEXT__
 
 输出示例结构：
-# AI 资讯 24 小时 | {DATE_STR}
+# AI 资讯 24 小时 | __DATE__
 ## 一、AI 技术
 ### 1. 标题
 - 摘要：……
@@ -71,66 +154,17 @@ PROMPT = f"""你是资深 AI 资讯编辑。请使用 web_search 工具，检索
 ……
 """
 
-WS_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 24}
 
-
-def call_api(messages):
+def call_llm(messages):
     resp = requests.post(
-        f"{ENDPOINT}",
-        headers={
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": MODEL,
-            "max_tokens": 8000,
-            "tools": [WS_TOOL],
-            "messages": messages,
-        },
+        CHAT_ENDPOINT,
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        json={"model": MODEL, "max_tokens": 8000, "messages": messages, "temperature": 0.3},
         timeout=300,
     )
     if resp.status_code != 200:
-        raise SystemExit(f"ERROR: API 调用失败 {resp.status_code}: {resp.text[:500]}")
+        raise SystemExit(f"ERROR: LLM 调用失败 {resp.status_code}: {resp.text[:500]}")
     return resp.json()
-
-
-def main():
-    messages = [{"role": "user", "content": PROMPT}]
-    final_text = ""
-    for _ in range(10):
-        resp = call_api(messages)
-        messages.append({"role": "assistant", "content": resp["content"]})
-        text = "".join(b.get("text", "") for b in resp["content"] if b.get("type") == "text")
-        if text.strip():
-            final_text = text
-        if resp.get("stop_reason") != "tool_use":
-            break
-        # web_search 由 Anthropic 服务端执行，这里回执确认即可
-        tool_results = []
-        for b in resp["content"]:
-            if b.get("type") == "tool_use":
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": b["id"],
-                    "content": "search completed",
-                })
-        if not tool_results:
-            break
-        messages.append({"role": "user", "content": tool_results})
-
-    if not final_text.strip():
-        raise SystemExit("ERROR: 模型未返回正文，可能当前网关不支持 web_search 工具，请检查 ANTHROPIC_BASE_URL")
-
-    # 规整：若模型带了一级标题则用之，否则补一个
-    if not final_text.lstrip().startswith("#"):
-        final_text = f"# AI 资讯 24 小时 | {DATE_STR}\n\n" + final_text
-
-    with open(OUT_MD, "w", encoding="utf-8") as f:
-        f.write(final_text)
-    with open("index.html", "w", encoding="utf-8") as f:
-        f.write(md_to_html(final_text, DATE_STR))
-    print(f"OK: 已生成 {OUT_MD} ({len(final_text)} 字符)")
 
 
 def md_to_html(md, date_str):
@@ -182,6 +216,24 @@ h3{{font-size:17px;margin-top:18px}}
 ul{{background:#f7f9fc;border-left:4px solid #2d6cdf;padding:10px 22px}}
 a{{color:#2d6cdf}}
 </style></head><body>{body}</body></html>"""
+
+
+def main():
+    results = gather()
+    context = build_context(results)
+    user_msg = PROMPT.replace("__DATE__", DATE_STR).replace("__CONTEXT__", context)
+    messages = [{"role": "user", "content": user_msg}]
+    resp = call_llm(messages)
+    text = resp["choices"][0]["message"]["content"]
+    if not text.strip():
+        raise SystemExit("ERROR: 模型未返回正文，可能网关不支持该模型或请求格式不符")
+    if not text.lstrip().startswith("#"):
+        text = f"# AI 资讯 24 小时 | {DATE_STR}\n\n" + text
+    with open(OUT_MD, "w", encoding="utf-8") as f:
+        f.write(text)
+    with open("index.html", "w", encoding="utf-8") as f:
+        f.write(md_to_html(text, DATE_STR))
+    print(f"OK: 已生成 {OUT_MD} ({len(text)} 字符, 检索到 {len(results)} 条素材)")
 
 
 if __name__ == "__main__":
