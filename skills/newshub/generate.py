@@ -59,6 +59,7 @@ def search_tavily(query, max_results=5):
             "https://api.tavily.com/search",
             json={"api_key": key, "query": query, "max_results": max_results,
                   "topic": "news", "days": 1},
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             timeout=30,
         )
         if r.status_code == 200:
