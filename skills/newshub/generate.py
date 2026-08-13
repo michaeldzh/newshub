@@ -90,25 +90,45 @@ def _req_json(url, headers=None, timeout=25):
     return None
 
 
+def _local(tag):
+    """去掉 XML 命名空间前缀，取本地标签名。"""
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+def _child(node, name):
+    for c in list(node):
+        if _local(c.tag) == name:
+            return c
+    return None
+
+
 def fetch_feed(url, max_items=3):
-    """通用 RSS/Atom 解析（直连来源，免 key）。失败静默返回空。"""
+    """通用 RSS/Atom 解析（直连来源，免 key，命名空间安全）。失败静默返回空。"""
     try:
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
         if r.status_code != 200:
             return []
-        text = re.sub(r'\sxmlns(:\w+)?="[^"]+"', " ", r.text)
-        root = ET.fromstring(text)
-        nodes = root.findall(".//item") or root.findall(".//entry")
+        root = ET.fromstring(r.content)
+        nodes = [e for e in root.iter() if _local(e.tag) in ("item", "entry")]
         out = []
         for node in nodes:
-            title = (node.findtext("title") or "").strip()
-            link_el = node.find("link")
-            link = ((link_el.get("href") if link_el is not None else None) or
-                    (link_el.text if link_el is not None else "") or "").strip()
-            pub = (node.findtext("pubDate") or node.findtext("published") or
-                   node.findtext("updated") or "").strip()
-            desc = (node.findtext("description") or node.findtext("summary") or
-                    node.findtext("content") or "")
+            t = _child(node, "title")
+            title = (t.text or "").strip() if t is not None else ""
+            le = _child(node, "link")
+            link = ((le.get("href") if le is not None else None) or
+                    (le.text if le is not None else "") or "").strip()
+            pub = ""
+            for pn in ("pubDate", "published", "updated", "date"):
+                pe = _child(node, pn)
+                if pe is not None and (pe.text or "").strip():
+                    pub = pe.text.strip()
+                    break
+            desc = ""
+            for dn in ("description", "summary", "content", "encoded"):
+                de = _child(node, dn)
+                if de is not None and (de.text or "").strip():
+                    desc = de.text
+                    break
             desc = re.sub(r"<.*?>", " ", desc or "")
             desc = re.sub(r"\s+", " ", desc).strip()[:400]
             if title and link:
