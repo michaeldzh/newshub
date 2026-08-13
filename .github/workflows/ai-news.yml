@@ -1,0 +1,60 @@
+name: AI 资讯日报
+
+on:
+  schedule:
+    # 每天北京时间 08:00 (UTC 0:00)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  ai-news:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          cd skills/newshub
+          pip install -r requirements.txt
+
+      - name: Generate AI news report
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+        run: |
+          cd skills/newshub
+          python generate_ai_news.py
+
+      - name: Push report to email
+        if: success()
+        continue-on-error: true
+        env:
+          NEWS_SMTP_USER: ${{ secrets.NEWS_SMTP_USER }}
+          NEWS_SMTP_TO: ${{ secrets.NEWS_SMTP_TO }}
+          NEWS_SMTP_AUTH: ${{ secrets.NEWS_SMTP_AUTH }}
+        run: |
+          cd skills/newshub
+          python push_email.py index.html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./skills/newshub
+          publish_branch: gh-pages
+          keep_files: false
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-news-${{ github.run_number }}
+          path: skills/newshub/index.html
+          retention-days: 30
