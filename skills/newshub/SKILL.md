@@ -1,43 +1,37 @@
 ---
-name: newshub
-description: 每天定时生成「AI 资讯 24 小时」日报（Claude 联网搜索筛选 20 条全球 AI 动态），并通过 163 邮箱推送到指定收件箱。Use when: (1) 生成每日 AI 资讯日报, (2) 把 AI 资讯推送到邮箱, (3) 在 GitHub Actions 上自动运行 AI 新闻聚合。
-license: MIT
+name: ai-news-email-push
+description: 生成并推送每日 AI 资讯日报。检索过去 24 小时全球 AI 动态（技术/应用/行业），筛选 20 条，经 163 邮箱定时推送。每天自动运行。
 ---
 
-# AI 资讯日报 Skill
+# 每日 AI 资讯日报（自包含 Skill）
 
-每天自动搜索过去 24 小时全球 AI 领域的重要动态（AI 技术 / AI 应用 / AI 行业），
-筛选 20 条有价值的国内外资讯，生成 HTML 报告并通过 163 邮箱推送。
+完全替换原 newshub 项目，与旧版 Claude Agent SDK / 天行数据聚合无任何关系。
 
-## 工作流程
+## 功能
+1. **generate.py** — 调用大模型 + web_search 联网检索，生成 `AI资讯24小时_YYYY年M月D日.md` 与 `index.html`（20 条，含标题/摘要/发布日期/来源/原文链接）。
+2. **push_email.py** — 将最新报告经 163 SMTP 推送至指定邮箱（HTML 正文 + 原文件附件）。
 
-1. `generate_ai_news.py`：调用 Claude API（启用 web_search 工具）联网搜索并生成
-   `index.html`（20 条 AI 资讯，含标题 / 摘要 / 发布日期 / 来源 / 原文链接）。
-2. `push_email.py`：读取 `index.html`，通过 163 SMTP 推送到邮箱（HTML 正文 + 附件）。
-
-## 环境变量 / Secrets（全部通过环境变量注入，绝不硬编码）
-
-| 变量 | 必填 | 说明 |
-|------|------|------|
-| `ANTHROPIC_API_KEY` | 是 | Claude API Key（用于联网搜索生成报告） |
-| `ANTHROPIC_BASE_URL` | 否 | 自定义 API 网关（默认 https://api.anthropic.com） |
-| `ANTHROPIC_MODEL` | 否 | 模型名（默认 claude-sonnet-4-5） |
-| `NEWS_SMTP_USER` | 否 | 发件人（默认 newshub01@163.com） |
-| `NEWS_SMTP_TO` | 否 | 收件人（默认 newshub01@163.com） |
-| `NEWS_SMTP_AUTH` | 是 | 163 邮箱客户端授权码 |
-
-## 本地运行
-
+## 运行方式
 ```bash
-cd skills/newshub
 pip install -r requirements.txt
-export ANTHROPIC_API_KEY=...
-export NEWS_SMTP_AUTH=...
-python generate_ai_news.py      # 生成 index.html
-python push_email.py index.html # 推送
+export ANTHROPIC_API_KEY=xxx        # 生成报告用
+export ANTHROPIC_BASE_URL=...        # 可选，默认 https://api.anthropic.com
+export ANTHROPIC_MODEL=...           # 可选
+python generate.py
+export NEWS_SMTP_AUTH=xxxx          # 163 授权码（必填）
+export NEWS_SMTP_TO=newshub01@163.com
+python push_email.py
 ```
 
-## GitHub Actions 定时
+## 定时
+通过 GitHub Actions（`.github/workflows/ai-news.yml`）每天北京时间 08:00 触发；亦可 `workflow_dispatch` 手动触发。密钥全部来自仓库 Secrets，不落盘。
 
-由 `.github/workflows/news-aggregator.yml` 每天定时触发（默认北京时间 08:00），
-自动完成「生成报告 → 推送邮箱」全流程，所有密钥通过仓库 Secrets 注入。
+## 环境变量
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `ANTHROPIC_API_KEY` | 是 | 生成报告用 |
+| `ANTHROPIC_BASE_URL` | 否 | 自定义 API 网关（默认官方） |
+| `ANTHROPIC_MODEL` | 否 | 模型名 |
+| `NEWS_SMTP_USER` | 否 | 发件人，默认 newshub01@163.com |
+| `NEWS_SMTP_TO` | 否 | 收件人，默认 newshub01@163.com |
+| `NEWS_SMTP_AUTH` | 是 | 163 邮箱授权码 |
