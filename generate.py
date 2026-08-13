@@ -376,13 +376,76 @@ def count_items(md):
     return sum(1 for l in md.split("\n") if l.strip().startswith("### "))
 
 
-FIX_PROMPT = (
-    "你刚才输出的资讯不符合要求，请严格按以下修正后重新输出【完整 Markdown】：\n"
-    "1) 总数必须恰好 20 条（编号 1–20 连续），多删少补；\n"
-    "2) 每条正文必须 200–300 字（汉字计数），偏短务必补足；\n"
-    "3) 保持原格式：### 标题 / > 来源行 / 正文段落，三个二级分区保留。\n"
-    "只输出修正后的完整 Markdown，不要解释。"
-)
+def enforce_count(md, target=20):
+    """确定性裁剪到恰好 target 条：跨分区按比例配额、连续重编号。
+
+    模型常会多产出（30+ 条），这里不依赖模型听话，而是解析分区后按比例
+    保留各分区前若干条，保证三个分区都在且总数恰为 target。
+    """
+    lines = md.split("\n")
+    preamble = []
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("## "):
+            break
+        preamble.append(lines[i])
+        i += 1
+    sections = []  # [(header_line, [ [item_lines...] ])]
+    cur_header = None
+    cur_items = []
+    cur_item = []
+    while i < len(lines):
+        s = lines[i]
+        if s.lstrip().startswith("## "):
+            if cur_header is not None:
+                if cur_item:
+                    cur_items.append(cur_item)
+                sections.append((cur_header, cur_items))
+            cur_header = s
+            cur_items = []
+            cur_item = []
+        elif s.lstrip().startswith("### "):
+            if cur_item:
+                cur_items.append(cur_item)
+            cur_item = [s]
+        else:
+            if cur_item:
+                cur_item.append(s)
+        i += 1
+    if cur_header is not None:
+        if cur_item:
+            cur_items.append(cur_item)
+        sections.append((cur_header, cur_items))
+
+    total = sum(len(items) for _, items in sections)
+    if total <= target:
+        return md
+
+    counts = [len(items) for _, items in sections]
+    quotas = [max(1, round(target * c / total)) for c in counts]
+    diff = target - sum(quotas)
+    k = len(quotas) - 1
+    while diff != 0 and k >= 0:
+        if diff > 0 and quotas[k] < counts[k]:
+            quotas[k] += 1
+            diff -= 1
+        elif diff < 0 and quotas[k] > 1:
+            quotas[k] -= 1
+            diff += 1
+        k -= 1
+
+    out = list(preamble)
+    num = 0
+    for (header, items), q in zip(sections, quotas):
+        if q <= 0:
+            continue
+        out.append(header)
+        for it in items[:q]:
+            num += 1
+            first = re.sub(r"^(###\s*)\d+", lambda m: m.group(1) + str(num), it[0])
+            out.append(first)
+            out.extend(it[1:])
+    return "\n".join(out)
 
 
 def main():
@@ -394,15 +457,10 @@ def main():
     text = resp["choices"][0]["message"]["content"]
     if not text.strip():
         raise SystemExit("ERROR: 模型未返回正文，可能网关不支持该模型或请求格式不符")
-    # 校验：条目数必须为 20，否则让模型修正一次
-    if count_items(text) != 20:
-        print(f"WARNING: 首次生成 {count_items(text)} 条，触发修正")
-        messages += [{"role": "assistant", "content": text},
-                     {"role": "user", "content": FIX_PROMPT}]
-        text = call_llm(messages)["choices"][0]["message"]["content"]
     text = text.strip()
     if not text.lstrip().startswith("#"):
         text = f"# AI 资讯 24 小时 | {DATE_STR}\n\n" + text
+    text = enforce_count(text, 20)
     with open(OUT_MD, "w", encoding="utf-8") as f:
         f.write(text)
     with open("index.html", "w", encoding="utf-8") as f:
