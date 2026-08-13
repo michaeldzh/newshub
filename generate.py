@@ -276,17 +276,18 @@ def build_context(results):
 
 
 PROMPT = """你是资深 AI 资讯编辑。下面是我从「厂商官网 + 中英文主流科技媒体」直接抓取的「过去 24 小时」全球 AI 动态素材（含真实原文链接）。
-请筛选 20 条最有价值的国内外信息，覆盖：一、AI 技术；二、AI 应用；三、AI 行业动态（侧重技术与应用），避免重复与低质软文。
+请严格筛选并输出【恰好 20 条】最有价值的国内外信息，覆盖：一、AI 技术；二、AI 应用；三、AI 行业动态（侧重技术与应用）。避免重复与低质软文。
 
-【每条输出格式，务必紧凑】
+【每条格式，务必紧凑】
 ### 序号. 标题
 > 来源：真实媒体/厂商名（如 OpenAI、机器之心、TechCrunch、NVIDIA Blog，严禁写“Google News”） · 发布日期（YYYY-MM-DD，无则写“近日”） · [原文](真实链接)
-（引用块之后另起一段）正文：用中文客观陈述该动态的要点、关键数据（型号/参数/金额/人名）与行业影响，200–300 字，不要空话套话，不要分点罗列。
+（引用块之后另起一段）正文：用中文客观陈述该动态的要点、关键数据（型号/参数/金额/人名）与行业影响。正文长度必须 200–300 字（按汉字计数，不含空行），宁可写满也不要少于 200 字；不要空话套话，不要分点罗列。
 
-【整体要求】
-- 按三个二级标题分区，合计 20 条（每区条数自定，但合计须为 20）。
+【硬性要求】
+- 总数必须恰好 20 条，编号从 1 到 20 连续，三个分区合计 20，不得多、不得少。
+- 按三个二级标题分区（每区条数自定，但合计须为 20）。
 - 直接输出 Markdown（从一级标题开始），不要前言、不要额外解释。
-- 素材中链接若是聚合页/跳转页，请尽量保留其指向的原始报道链接；若只有聚合链接也接受。
+- 素材链接若是聚合/跳转页，尽量保留指向原始报道的链接；只有聚合链接也接受。
 
 素材：
 __CONTEXT__
@@ -370,6 +371,20 @@ li{{margin:3px 0}}
 </style></head><body>{body}</body></html>"""
 
 
+def count_items(md):
+    """统计资讯条目数（以 '### ' 开头的行）。"""
+    return sum(1 for l in md.split("\n") if l.strip().startswith("### "))
+
+
+FIX_PROMPT = (
+    "你刚才输出的资讯不符合要求，请严格按以下修正后重新输出【完整 Markdown】：\n"
+    "1) 总数必须恰好 20 条（编号 1–20 连续），多删少补；\n"
+    "2) 每条正文必须 200–300 字（汉字计数），偏短务必补足；\n"
+    "3) 保持原格式：### 标题 / > 来源行 / 正文段落，三个二级分区保留。\n"
+    "只输出修正后的完整 Markdown，不要解释。"
+)
+
+
 def main():
     results = gather()
     context = build_context(results)
@@ -379,13 +394,20 @@ def main():
     text = resp["choices"][0]["message"]["content"]
     if not text.strip():
         raise SystemExit("ERROR: 模型未返回正文，可能网关不支持该模型或请求格式不符")
+    # 校验：条目数必须为 20，否则让模型修正一次
+    if count_items(text) != 20:
+        print(f"WARNING: 首次生成 {count_items(text)} 条，触发修正")
+        messages += [{"role": "assistant", "content": text},
+                     {"role": "user", "content": FIX_PROMPT}]
+        text = call_llm(messages)["choices"][0]["message"]["content"]
+    text = text.strip()
     if not text.lstrip().startswith("#"):
         text = f"# AI 资讯 24 小时 | {DATE_STR}\n\n" + text
     with open(OUT_MD, "w", encoding="utf-8") as f:
         f.write(text)
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(md_to_html(text, DATE_STR))
-    print(f"OK: 已生成 {OUT_MD} ({len(text)} 字符, 检索到 {len(results)} 条素材)")
+    print(f"OK: 已生成 {OUT_MD} ({len(text)} 字符, {count_items(text)} 条, 检索到 {len(results)} 条素材)")
 
 
 if __name__ == "__main__":
