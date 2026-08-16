@@ -18,7 +18,10 @@ skills/newshub/
 每条资讯包含：**标题 / 摘要 / 发布日期 / 来源 / 原文链接**，分「AI 技术 / AI 应用 / AI 行业动态」三栏，合计 20 条。
 
 ## 定时运行
-由 GitHub Actions 每天 **北京时间 08:00** 触发（`.github/workflows/ai-news.yml`），也可在 Actions 页手动 `Run workflow` 立即测试。
+由 GitHub Actions 每天 **北京时间 07:00**（UTC 23:00 前一日，cron `0 23 * * *`）触发（`.github/workflows/ai-news.yml`），也可在 Actions 页手动 `Run workflow` 立即测试。
+
+## 去重
+`generate.py` 生成前会读取本目录最近 3 份 `AI资讯24小时_*.md`，汇总「事件标题 + 原文链接」作为"已覆盖集合"注入提示词，强制**跨日 + 本日内去重**，仅收录过去 24 小时内新闻。生成的日报会提交回仓库，供次日跨日去重使用。
 
 ## 密钥（全部走 Secrets，零硬编码）
 | Secret | 必填 | 说明 |
