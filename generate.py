@@ -19,6 +19,7 @@
 
 import os
 import re
+import glob
 import datetime
 import xml.etree.ElementTree as ET
 import requests
@@ -36,6 +37,7 @@ if not BASE_URL:
 DATE = datetime.date.today()
 DATE_STR = f"{DATE.year}年{DATE.month}月{DATE.day}日"
 OUT_MD = f"AI资讯24小时_{DATE_STR}.md"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── 多样化直连 RSS（厂商官网 + 中英文主流科技媒体）──────────────────────
 FEEDS = [
@@ -240,6 +242,37 @@ def search_ddg(query, max_results=5):
         return []
 
 
+def load_covered(limit=3):
+    """读取本目录最近的日报，汇总已收录事件的「标题 + 原文链接」，供跨日去重。
+
+    仅读取最近 limit 份（按修改时间倒序），排除今天待生成的文件。
+    返回去重后的字符串列表，便于直接注入给大模型的去重指令。
+    """
+    files = glob.glob(os.path.join(SCRIPT_DIR, "AI资讯24小时_*.md"))
+    files = [f for f in files if os.path.basename(f) != OUT_MD]
+    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    items = []
+    for f in files[:limit]:
+        try:
+            txt = open(f, encoding="utf-8").read()
+        except Exception:
+            continue
+        for line in txt.split("\n"):
+            m = re.match(r"###\s*\d+\.\s*(.+)", line.strip())
+            if m:
+                title = m.group(1).replace("**", "").strip()
+                if title:
+                    items.append(title)
+        for url in re.findall(r"https?://[^\s)\]]+", txt):
+            items.append(url)
+    seen, uniq = set(), []
+    for it in items:
+        if it and it not in seen:
+            seen.add(it)
+            uniq.append(it)
+    return uniq
+
+
 def gather():
     all_res = []
     seen = set()
@@ -288,6 +321,12 @@ PROMPT = """你是资深 AI 资讯编辑。下面是我从「厂商官网 + 中�
 - 按三个二级标题分区（每区条数自定，但合计须为 20）。
 - 直接输出 Markdown（从一级标题开始），不要前言、不要额外解释。
 - 素材链接若是聚合/跳转页，尽量保留指向原始报道的链接；只有聚合链接也接受。
+
+【强制去重（跨日 + 本日）】
+以下是此前日报已收录的新闻（事件标题与原文链接），本次严禁重复收录其中任何一条；即便有新报道角度也不再重复。仅当某事件出现实质性新进展（新版本/新金额/新状态）时，才可收录为"进展更新"，且同一事件只保留最新一条。同时只收录过去 24 小时内的新闻，超窗且已在往期出现的旧闻不收录。成稿后自查：与上述"已覆盖集合"零重复、本期内部零重复、总数恰为 20 条。
+
+已覆盖集合（近期日报）：
+__DEDUP__
 
 素材：
 __CONTEXT__
@@ -451,7 +490,11 @@ def enforce_count(md, target=20):
 def main():
     results = gather()
     context = build_context(results)
-    user_msg = PROMPT.replace("__DATE__", DATE_STR).replace("__CONTEXT__", context)
+    covered = load_covered(limit=3)
+    covered_block = "\n".join(f"- {it}" for it in covered) or "（无，本期为首期日报）"
+    user_msg = (PROMPT.replace("__DATE__", DATE_STR)
+                .replace("__CONTEXT__", context)
+                .replace("__DEDUP__", covered_block))
     messages = [{"role": "user", "content": user_msg}]
     resp = call_llm(messages)
     text = resp["choices"][0]["message"]["content"]
