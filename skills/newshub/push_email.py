@@ -1,128 +1,108 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-每日 AI 资讯 → 163 邮箱推送（仓库内自包含版本）
+"""把 AI 资讯日报通过 163 SMTP 推送到邮箱。
 
-读取当前目录下最新的 AI资讯24小时_*.md，转 HTML 正文并作为附件，经 163 SMTP(SSL) 发送。
-所有敏感信息经环境变量注入，不硬编码。
+用法:
+  python push_email.py                      自动取当天日报（md + index.html）
+  python push_email.py <md路径> [html路径]  显式指定
 
-环境变量：
-  NEWS_SMTP_USER   发件人，默认 newshub01@163.com
-  NEWS_SMTP_TO     收件人，默认 newshub01@163.com
-  NEWS_SMTP_AUTH   163 授权码（必填，由调用方注入 Secrets）
-可选参数：
-  python push_email.py [指定md路径]
+行为:
+  - 正文 = index.html（渲染后的 HTML，收件人直接可见标题/摘要/来源/原文链接）
+  - 附件 = 日报 Markdown 原文（供存档）
+  - 主题 = "AI 资讯 24 小时 | YYYY年M月D日"，日期按北京时间且优先取文件名
+
+凭据（必须经由环境变量注入，绝不硬编码）:
+  NEWS_SMTP_USER  发件人（默认 newshub01@163.com）
+  NEWS_SMTP_TO    收件人（默认 newshub01@163.com）
+  NEWS_SMTP_AUTH  163 客户端授权码（必填，缺失则报错退出）
 """
 
 import os
 import re
 import sys
-import ssl
+import glob
 import smtplib
-import base64
-import datetime
-import email.utils
+import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-from pathlib import Path
+from email.header import Header
+from datetime import datetime, timezone, timedelta
 
 SMTP_HOST = "smtp.163.com"
 SMTP_PORT = 465
-SENDER = os.environ.get("NEWS_SMTP_USER") or "newshub01@163.com"
-RECIPIENT = os.environ.get("NEWS_SMTP_TO") or "newshub01@163.com"
+SENDER = os.environ.get("NEWS_SMTP_USER", "newshub01@163.com")
+RECIPIENT = os.environ.get("NEWS_SMTP_TO", "newshub01@163.com")
 AUTH = os.environ.get("NEWS_SMTP_AUTH")
 
-if not AUTH:
-    raise SystemExit("ERROR: 环境变量 NEWS_SMTP_AUTH 未设置（163 邮箱授权码）")
+NAME_RE = re.compile(r"AI资讯24小时_(\d{4})年(\d{1,2})月(\d{1,2})日\.md")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def find_latest_md():
-    here = Path(".")
-    files = sorted(here.glob("AI资讯24小时_*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+def pick_latest_md():
+    files = glob.glob(os.path.join(SCRIPT_DIR, "AI资讯24小时_*.md"))
     if not files:
-        raise SystemExit("ERROR: 未找到 AI资讯24小时_*.md")
-    return files[0]
+        return None
+    return max(files, key=os.path.getmtime)
 
 
-def md_to_html(md):
-    out, in_list = [], False
+def subject_from(md_path):
+    m = NAME_RE.search(os.path.basename(md_path or ""))
+    if m:
+        return "AI 资讯 24 小时 | %s年%s月%s日" % (m.group(1), int(m.group(2)), int(m.group(3)))
+    bj = timezone(timedelta(hours=8))
+    d = datetime.now(bj)
+    return "AI 资讯 24 小时 | %d年%d月%d日" % (d.year, d.month, d.day)
 
-    def inline(t):
-        t = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2" target="_blank">\1</a>', t)
-        t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
-        return t
 
-    for line in md.split("\n"):
-        s = line.strip()
-        if s.startswith("### "):
-            if in_list:
-                out.append("</ul>"); in_list = False
-            out.append(f"<h3>{inline(s[4:])}</h3>")
-        elif s.startswith("## "):
-            if in_list:
-                out.append("</ul>"); in_list = False
-            out.append(f"<h2>{inline(s[3:])}</h2>")
-        elif s.startswith("# "):
-            if in_list:
-                out.append("</ul>"); in_list = False
-            out.append(f"<h1>{inline(s[2:])}</h1>")
-        elif s.startswith("- "):
-            if not in_list:
-                out.append("<ul>"); in_list = True
-            out.append(f"<li>{inline(s[2:])}</li>")
-        elif s == "":
-            if in_list:
-                out.append("</ul>"); in_list = False
-            out.append("<br>")
-        else:
-            if in_list:
-                out.append("</ul>"); in_list = False
-            out.append(f"<p>{inline(s)}</p>")
-    if in_list:
-        out.append("</ul>")
-    body = "\n".join(out)
-    today = datetime.date.today().strftime("%Y年%-m月%-d日") if hasattr(datetime.date.today(), "strftime") else ""
-    return f"""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{{font-family:-apple-system,'Microsoft YaHei',sans-serif;max-width:860px;margin:0 auto;padding:24px;line-height:1.7;color:#1f2328}}
-h1{{font-size:26px;border-bottom:3px solid #2d6cdf;padding-bottom:8px}}
-h2{{font-size:21px;margin-top:28px;color:#2d6cdf}}
-h3{{font-size:17px;margin-top:18px}}
-ul{{background:#f7f9fc;border-left:4px solid #2d6cdf;padding:10px 22px}}
-a{{color:#2d6cdf}}
-</style></head><body>{body}</body></html>"""
+def attach_file(msg, path, mime_subtype):
+    with open(path, "rb") as f:
+        part = MIMEBase("application", mime_subtype)
+        part.set_payload(f.read())
+    encoders.encode_base64(part)
+    # 中文文件名需按 RFC2231 编码，否则部分客户端显示为乱码
+    fname = os.path.basename(path)
+    part.add_header("Content-Disposition", "attachment", filename=("utf-8", "", fname))
+    msg.attach(part)
 
 
 def main():
-    path = Path(sys.argv[1]) if len(sys.argv) > 1 else find_latest_md()
-    md = path.read_text(encoding="utf-8")
-    html_body = md_to_html(md)
-    title = path.stem
+    if not AUTH:
+        print("ERROR: 缺少授权码。请设置 NEWS_SMTP_AUTH（GitHub Actions 中用 secrets 注入）。",
+              file=sys.stderr)
+        sys.exit(1)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"AI 资讯 24 小时 | {title.replace('AI资讯24小时_', '').replace('_', ' ')}"
+    args = [a for a in sys.argv[1:] if a]
+    md_path = args[0] if len(args) > 0 else pick_latest_md()
+    html_path = args[1] if len(args) > 1 else os.path.join(SCRIPT_DIR, "index.html")
+
+    if not md_path or not os.path.exists(md_path):
+        print("ERROR: 未找到日报 Markdown。当前目录：%s" % SCRIPT_DIR, file=sys.stderr)
+        sys.exit(1)
+    if not os.path.exists(html_path):
+        print("ERROR: 未找到 HTML 正文：%s" % html_path, file=sys.stderr)
+        sys.exit(1)
+
+    with open(html_path, "r", encoding="utf-8") as f:
+        html = f.read()
+
+    subject = subject_from(md_path)
+
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = Header(subject, "utf-8")
     msg["From"] = SENDER
     msg["To"] = RECIPIENT
-    msg["Date"] = email.utils.formatdate(localtime=True)
-    msg.attach(MIMEText(md, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    with open(path, "rb") as f:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(f.read())
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", 'attachment', filename=path.name)
-    msg.attach(part)
+    msg.attach(MIMEText(html, "html", "utf-8"))
+    attach_file(msg, md_path, "octet-stream")
 
     ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as s:
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=60) as s:
         s.login(SENDER, AUTH)
         s.sendmail(SENDER, [RECIPIENT], msg.as_string())
-    print(f"OK: 已推送 {path.name} 至 {RECIPIENT}")
+
+    print("OK: 邮件已发送 | 主题=%s | 收件人=%s | 附件=%s"
+          % (subject, RECIPIENT, os.path.basename(md_path)))
 
 
 if __name__ == "__main__":
