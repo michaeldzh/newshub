@@ -1,47 +1,64 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-每日 AI 资讯生成器（仓库内自包含版本，OpenAI 兼容网关 + 解耦搜索）
+"""每日 AI 资讯生成器（v2 · 确定性去重版）
 
-检索策略（解耦，不依赖单一来源）：
-  1) 直连 RSS：厂商官网 + 中英文主流科技媒体的直接 RSS（来源多样、链接真实）
-  2) 关键词检索补充：Tavily(设 TAVILY_API_KEY 时) -> 免 key 的 Google News RSS + Hacker News -> DDG 兜底
-将检索结果交给 LLM（OpenAI Chat Completions 格式）总结，生成 20 条结构化资讯。
-输出 Markdown: AI资讯24小时_YYYY年M月D日.md 与 index.html（紧凑排版，正文 200–300 字）。
-密钥全走环境变量 / Secrets，不硬编码。
+与 v1 的关键差异
+----------------
+v1 的去重是「软」的：把最近 3 份日报的标题/链接塞进提示词，指望模型自觉不重复；
+而工作流从未把生成的日报提交回仓库，所以那 3 份永远是 0 份 → 跨日去重完全空转，
+导致同一事件隔几天就换个链接重发。
 
-环境变量：
-  ANTHROPIC_API_KEY   必填，LLM 网关 Bearer key（对 agnes 即用其 key）
-  ANTHROPIC_BASE_URL  必填，网关基址，如 https://api.agnes-ai.cn/v1
+v2 的做法：
+  1. **全量历史**：读取报告目录下全部 `AI资讯24小时_*.md`（不再只取最近 3 份），
+     汇总链接 / 标题 / 事件指纹（见 dedup.py）。
+  2. **确定性闸门**：生成后用 dedup.filter_report 硬性丢弃重复与超限条目，
+     不依赖模型是否听话。
+  3. **缺口自愈**：被丢弃的位置按分区向模型追加补稿，最多 3 轮；
+     始终凑不满或仍有硬错误 → **退出码 1**（宁可当天不发，也不推重复内容）。
+  4. 提示词里的"已覆盖集合"只是引导（截取近 N 条），真正的判定在本地代码里。
+
+环境变量
+--------
+  ANTHROPIC_API_KEY   必填，LLM 网关 Bearer key
+  ANTHROPIC_BASE_URL  必填，网关基址（如 https://api.agnes-ai.cn/v1）
   ANTHROPIC_MODEL     模型名，默认 agnes-2.0-flash
-  TAVILY_API_KEY      可选，搜索源；不填则退化为免 key 检索
+  TAVILY_API_KEY      可选，搜索源
+  REPORT_DIR          可选，日报所在目录（默认本脚本目录）
+  HISTORY_PROMPT_LIMIT 可选，提示词中注入的历史条目上限（默认 240）
+  MAX_REPAIR_ROUNDS   可选，补稿轮数上限（默认 3）
 """
 
+import datetime
 import os
 import re
-import glob
-import datetime
+import sys
 import xml.etree.ElementTree as ET
+
 import requests
 
+import dedup
+
+REPORT_DIR = os.environ.get("REPORT_DIR") or os.path.dirname(os.path.abspath(__file__))
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.agnes-ai.cn/v1").rstrip("/")
 MODEL = os.environ.get("ANTHROPIC_MODEL") or "agnes-2.0-flash"
 CHAT_ENDPOINT = BASE_URL + "/chat/completions"
+HISTORY_PROMPT_LIMIT = int(os.environ.get("HISTORY_PROMPT_LIMIT") or 240)
+MAX_REPAIR_ROUNDS = int(os.environ.get("MAX_REPAIR_ROUNDS") or 3)
+TARGET_TOTAL = 20
+TARGET_SECTIONS = [7, 7, 6]
+SECTION_ORDINALS = "一二三四"
 
 if not API_KEY:
     raise SystemExit("ERROR: 环境变量 ANTHROPIC_API_KEY 未设置")
-if not BASE_URL:
-    raise SystemExit("ERROR: 环境变量 ANTHROPIC_BASE_URL 未设置")
 
 DATE = datetime.date.today()
 DATE_STR = f"{DATE.year}年{DATE.month}月{DATE.day}日"
 OUT_MD = f"AI资讯24小时_{DATE_STR}.md"
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUT_MD_PATH = os.path.join(REPORT_DIR, OUT_MD)
 
 # ── 多样化直连 RSS（厂商官网 + 中英文主流科技媒体）──────────────────────
 FEEDS = [
-    # 国际厂商 / 媒体
     "https://techcrunch.com/category/artificial-intelligence/feed/",
     "https://venturebeat.com/category/ai/feed/",
     "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml",
@@ -60,7 +77,6 @@ FEEDS = [
     "https://huggingface.co/blog/feed.xml",
     "https://rss.arxiv.org/rss/cs.AI",
     "https://rss.arxiv.org/rss/cs.CL",
-    # 国内媒体
     "https://www.qbitai.com/feed",
     "https://36kr.com/feed",
     "https://www.ithome.com/rss/",
@@ -69,31 +85,36 @@ FEEDS = [
     "https://www.aibase.com/zh/ai-news/rss",
 ]
 
-# 关键词检索补充（中文 + 英文，覆盖厂商与细分方向）
 QUERIES = [
     "AI artificial intelligence news today",
     "OpenAI Anthropic Google DeepMind NVIDIA latest announcement",
-    "large language model release August 2026",
+    "large language model release",
     "AI agent coding assistant news",
     "人工智能 大模型 最新动态 今日",
     "字节跳动 阿里 腾讯 百度 大模型 最新发布",
-    "AI chip semiconductor news 2026",
+    "AI chip semiconductor news",
     "machine learning research breakthrough this week",
 ]
 
 
-def _req_json(url, headers=None, timeout=25):
+# ══════════════════════════════════════════════════════════════════════
+# 素材检索
+# ══════════════════════════════════════════════════════════════════════
+def _req_json(url, headers=None, timeout=25, method="GET", payload=None):
     try:
-        r = requests.get(url, headers=headers or {}, timeout=timeout)
+        if method == "POST":
+            r = requests.post(url, headers=headers or {}, json=payload, timeout=timeout)
+        else:
+            r = requests.get(url, headers=headers or {}, timeout=timeout)
         if r.status_code == 200:
             return r.json()
-    except Exception as e:
-        print("req_json error:", e)
+        print(f"  [warn] {method} {url[:60]} -> HTTP {r.status_code}")
+    except Exception as e:  # noqa: BLE001
+        print("  [warn] req error:", e)
     return None
 
 
 def _local(tag):
-    """去掉 XML 命名空间前缀，取本地标签名。"""
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
@@ -131,44 +152,45 @@ def fetch_feed(url, max_items=3):
                 if de is not None and (de.text or "").strip():
                     desc = de.text
                     break
-            desc = re.sub(r"<.*?>", " ", desc or "")
-            desc = re.sub(r"\s+", " ", desc).strip()[:400]
+            desc = re.sub(r"\s+", " ", re.sub(r"<.*?>", " ", desc or "")).strip()[:400]
             if title and link:
                 out.append({"title": title, "url": link,
                             "content": desc or title, "published": pub})
             if len(out) >= max_items:
                 break
         return out
-    except Exception as e:
-        print(f"feed error {url[:50]}: {e}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] feed error {url[:50]}: {e}")
         return []
 
 
 def search_tavily(query, max_results=5):
-    """优先：Tavily（需 TAVILY_API_KEY，由 workflow 传入；未传入则跳过）。"""
+    """Tavily 检索。
+
+    注意：Tavily 的 /search 只接受 **POST + JSON body**；v1 用 GET 且不带 body，
+    因此永远拿不到结果（静默退化到 Google News），这里修正为 POST。
+    """
     key = os.environ.get("TAVILY_API_KEY")
     if not key:
         return None
     data = _req_json(
         "https://api.tavily.com/search",
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        timeout=30,
+        timeout=30, method="POST",
+        payload={"query": query, "max_results": max_results, "search_depth": "basic"},
     )
     if not data:
         return None
-    out = []
-    for it in data.get("results", []):
-        out.append({
-            "title": it.get("title", ""),
-            "url": it.get("url", ""),
-            "content": (it.get("content") or "")[:600],
-            "published": it.get("published_date", ""),
-        })
-    return out
+    return [{
+        "title": it.get("title", ""),
+        "url": it.get("url", ""),
+        "content": (it.get("content") or "")[:600],
+        "published": it.get("published_date", ""),
+    } for it in data.get("results", [])]
 
 
 def search_gnews(query, max_results=5):
-    """免 key 兜底：Google News RSS（覆盖中英文全球新闻）。"""
+    """免 key 兜底：Google News RSS。"""
     try:
         from urllib.parse import quote
         url = ("https://news.google.com/rss/search?q=%s&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
@@ -187,13 +209,12 @@ def search_gnews(query, max_results=5):
             if len(out) >= max_results:
                 break
         return out
-    except Exception as e:
-        print("GNews error:", e)
+    except Exception as e:  # noqa: BLE001
+        print("  [warn] GNews error:", e)
         return []
 
 
 def search_hn(query, max_results=5):
-    """免 key 兜底：Hacker News Algolia（技术深度好）。"""
     from urllib.parse import quote
     data = _req_json(
         "https://hn.algolia.com/api/v1/search?query=%s&tags=story&hitsPerPage=%d"
@@ -205,127 +226,68 @@ def search_hn(query, max_results=5):
     out = []
     for h in data.get("hits", []):
         oid = h.get("objectID", "")
-        url = h.get("url") or ("https://news.ycombinator.com/item?id=%s" % oid)
         out.append({
             "title": h.get("title", ""),
-            "url": url,
+            "url": h.get("url") or ("https://news.ycombinator.com/item?id=%s" % oid),
             "content": (h.get("story_text") or "")[:400] or h.get("title", ""),
             "published": h.get("created_at", ""),
         })
     return out
 
 
-def search_ddg(query, max_results=5):
-    try:
-        r = requests.post(
-            "https://lite.duckduckgo.com/lite/",
-            data={"q": query},
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            timeout=25,
-        )
-        if r.status_code != 200:
-            return []
-        text = r.text
-        titles = re.findall(r'class="result-link"[^>]*>(.*?)</a>', text, re.S)
-        urls = re.findall(r'class="result-link"[^>]*href="(.*?)"', text)
-        snippets = re.findall(r'class="result-snippet">(.*?)</td>', text, re.S)
-        results = []
-        for i in range(min(max_results, len(titles))):
-            url = urls[i] if i < len(urls) else ""
-            title = re.sub(r"<.*?>", "", titles[i]).strip()
-            snippet = re.sub(r"<.*?>", "", snippets[i]).strip() if i < len(snippets) else ""
-            if url and url.startswith("http"):
-                results.append({"title": title, "url": url, "content": snippet, "published": ""})
-        return results
-    except Exception as e:
-        print("DDG error:", e)
-        return []
-
-
-def load_covered(limit=3):
-    """读取本目录最近的日报，汇总已收录事件的「标题 + 原文链接」，供跨日去重。
-
-    仅读取最近 limit 份（按修改时间倒序），排除今天待生成的文件。
-    返回去重后的字符串列表，便于直接注入给大模型的去重指令。
-    """
-    files = glob.glob(os.path.join(SCRIPT_DIR, "AI资讯24小时_*.md"))
-    files = [f for f in files if os.path.basename(f) != OUT_MD]
-    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
-    items = []
-    for f in files[:limit]:
-        try:
-            txt = open(f, encoding="utf-8").read()
-        except Exception:
-            continue
-        for line in txt.split("\n"):
-            m = re.match(r"###\s*\d+\.\s*(.+)", line.strip())
-            if m:
-                title = m.group(1).replace("**", "").strip()
-                if title:
-                    items.append(title)
-        for url in re.findall(r"https?://[^\s)\]]+", txt):
-            items.append(url)
-    seen, uniq = set(), []
-    for it in items:
-        if it and it not in seen:
-            seen.add(it)
-            uniq.append(it)
-    return uniq
-
-
 def gather():
-    all_res = []
-    seen = set()
-    # 1) 直连 RSS（多样化来源）
+    all_res, seen = [], set()
     for url in FEEDS:
         for it in fetch_feed(url):
             if it.get("url") and it["url"] not in seen:
                 seen.add(it["url"])
                 all_res.append(it)
     print(f"feeds -> {len(all_res)} 条素材")
-    # 2) 关键词检索补充
     for q in QUERIES:
-        res = search_tavily(q) or (search_gnews(q) + search_hn(q)) or search_ddg(q)
+        res = search_tavily(q) or (search_gnews(q) + search_hn(q))
         n = 0
         for it in (res or []):
             if it.get("url") and it["url"] not in seen:
                 seen.add(it["url"])
                 all_res.append(it)
                 n += 1
-        print(f"query={q!r} -> {n} new results")
-    # 控制上下文体量
-    return all_res[:100]
+        print(f"query={q!r} -> {n} new")
+    return all_res[:120]
 
 
 def build_context(results):
-    lines = []
-    for i, it in enumerate(results, 1):
-        lines.append(
-            f"[{i}] 标题：{it.get('title', '')}\n"
-            f"链接：{it.get('url', '')}\n"
-            f"摘要：{it.get('content', '')}\n"
-        )
-    return "\n".join(lines)
+    return "\n".join(
+        f"[{i}] 标题：{it.get('title', '')}\n链接：{it.get('url', '')}\n"
+        f"摘要：{it.get('content', '')}\n"
+        for i, it in enumerate(results, 1)
+    )
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 提示词
+# ══════════════════════════════════════════════════════════════════════
 PROMPT = """你是资深 AI 资讯编辑。下面是我从「厂商官网 + 中英文主流科技媒体」直接抓取的「过去 24 小时」全球 AI 动态素材（含真实原文链接）。
-请严格筛选并输出【恰好 20 条】最有价值的国内外信息，覆盖：一、AI 技术；二、AI 应用；三、AI 行业动态（侧重技术与应用）。避免重复与低质软文。
+请严格筛选并输出【恰好 20 条】最有价值的国内外信息，分三个二级标题分区：
+## 一、AI 技术（7 条）
+## 二、AI 应用（7 条）
+## 三、AI 行业动态（6 条）
 
 【每条格式，务必紧凑】
 ### 序号. 标题
-> 来源：真实媒体/厂商名（如 OpenAI、机器之心、TechCrunch、NVIDIA Blog，严禁写“Google News”） · 发布日期（YYYY-MM-DD，无则写“近日”） · [原文](真实链接)
-（引用块之后另起一段）正文：用中文客观陈述该动态的要点、关键数据（型号/参数/金额/人名）与行业影响。正文长度必须 200–300 字（按汉字计数，不含空行），宁可写满也不要少于 200 字；不要空话套话，不要分点罗列。
+> 来源：真实媒体/厂商名（如 OpenAI、机器之心、TechCrunch、NVIDIA Blog，严禁写“Google News”） · 发布日期（YYYY-MM-DD） · [原文](真实链接)
+（引用块之后另起一段）正文：用中文客观陈述该动态的要点、关键数据与行业影响，200–300 字，不分点罗列。
 
 【硬性要求】
-- 总数必须恰好 20 条，编号从 1 到 20 连续，三个分区合计 20，不得多、不得少。
-- 按三个二级标题分区（每区条数自定，但合计须为 20）。
+- 总数恰好 20 条，编号 1 到 20 连续，三个分区分别为 7 / 7 / 6 条。
 - 直接输出 Markdown（从一级标题开始），不要前言、不要额外解释。
-- 素材链接若是聚合/跳转页，尽量保留指向原始报道的链接；只有聚合链接也接受。
+- 发布日期必须落在 __LO__ ~ __HI__ 之间。
 
-【强制去重（跨日 + 本日）】
-以下是此前日报已收录的新闻（事件标题与原文链接），本次严禁重复收录其中任何一条；即便有新报道角度也不再重复。仅当某事件出现实质性新进展（新版本/新金额/新状态）时，才可收录为"进展更新"，且同一事件只保留最新一条。同时只收录过去 24 小时内的新闻，超窗且已在往期出现的旧闻不收录。成稿后自查：与上述"已覆盖集合"零重复、本期内部零重复、总数恰为 20 条。
+【强制去重（跨全部历史 + 本日）】
+以下"已覆盖集合"只是近期样例，**判定会覆盖仓库中全部历史日报**。严禁重复收录其中的事件；同一事件即便换了媒体、换了链接也不再收录。
+若某事件确有实质性新进展（新版本/新金额/新状态），标题须以 `【进展更新】` 开头，且只保留最新一条。
+同一厂商单期最多 2 条。成稿后自查：与已覆盖集合零重复、期内零重复、总数恰为 20。
 
-已覆盖集合（近期日报）：
+已覆盖集合（样例）：
 __DEDUP__
 
 素材：
@@ -337,30 +299,58 @@ __CONTEXT__
 
 ## 一、AI 技术
 ### 1. 标题
-> 来源：OpenAI · 2026-08-13 · [原文](https://...)
-正文内容 200–300 字……
+> 来源：OpenAI · __HI__ · [原文](https://...)
+正文：……
+"""
+
+TOPUP_PROMPT = """这是今天的 AI 资讯日报，因部分条目与其他条目/往期日报重复，已被系统剔除。
+请**仅补充缺失的条目**，使三个分区回到 7 / 7 / 6 条。
+
+【禁止重复】以下清单中的事件/链接一律不得再出现（含本期已保留条目、已剔除条目、往期已覆盖条目）：
+__BANNED__
+
+【仅补充这些】
+__NEED__
+
+【格式】只输出需要补充的条目，并带上所属分区标题，例如：
+## 二、AI 应用
+### 21. 标题
+> 来源：媒体名 · __HI__ · [原文](真实链接)
+正文：……
+
+要求：来源与链接必须来自下面的素材；正文 200–300 字；发布日期落在 __LO__ ~ __HI__。
+
+素材：
+__CONTEXT__
 """
 
 
-def call_llm(messages):
+def call_llm(user_msg, max_tokens=8000):
     resp = requests.post(
         CHAT_ENDPOINT,
         headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-        json={"model": MODEL, "max_tokens": 8000, "messages": messages, "temperature": 0.3},
+        json={"model": MODEL, "max_tokens": max_tokens,
+              "messages": [{"role": "user", "content": user_msg}],
+              "temperature": 0.3},
         timeout=300,
     )
     if resp.status_code != 200:
         raise SystemExit(f"ERROR: LLM 调用失败 {resp.status_code}: {resp.text[:500]}")
-    return resp.json()
+    text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+    if not text:
+        raise SystemExit("ERROR: 模型未返回正文（网关可能不支持该模型）")
+    return text
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 输出
+# ══════════════════════════════════════════════════════════════════════
 def md_to_html(md, date_str):
     out, in_list = [], False
 
     def inline(t):
         t = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2" target="_blank">\1</a>', t)
-        t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
-        return t
+        return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
 
     for line in md.split("\n"):
         s = line.strip()
@@ -382,11 +372,7 @@ def md_to_html(md, date_str):
             if not in_list:
                 out.append("<ul>"); in_list = True
             out.append(f"<li>{inline(s[2:])}</li>")
-        elif s == "":
-            if in_list:
-                out.append("</ul>"); in_list = False
-            # 紧凑：不额外加 <br>
-        else:
+        elif s:
             if in_list:
                 out.append("</ul>"); in_list = False
             out.append(f"<p>{inline(s)}</p>")
@@ -410,106 +396,166 @@ li{{margin:3px 0}}
 </style></head><body>{body}</body></html>"""
 
 
-def count_items(md):
-    """统计资讯条目数（以 '### ' 开头的行）。"""
-    return sum(1 for l in md.split("\n") if l.strip().startswith("### "))
+# ══════════════════════════════════════════════════════════════════════
+# 主流程
+# ══════════════════════════════════════════════════════════════════════
+def section_index(header):
+    """把分区标题映射到 0/1/2（按「一/二/三」序数，容错标题措辞变化）。"""
+    for i, ch in enumerate(SECTION_ORDINALS):
+        if (header or "").strip().startswith(ch):
+            return i
+    return None
 
 
-def enforce_count(md, target=20):
-    """确定性裁剪到恰好 target 条：跨分区按比例配额、连续重编号。
+def deficits_of(sections):
+    """各分区相比目标 7/7/6 的缺口。"""
+    counts = [0, 0, 0]
+    for sec in sections:
+        idx = section_index(sec["header"])
+        if idx is not None and idx < 3:
+            counts[idx] += len(sec["items"])
+    return [max(0, TARGET_SECTIONS[i] - counts[i]) for i in range(3)], counts
 
-    模型常会多产出（30+ 条），这里不依赖模型听话，而是解析分区后按比例
-    保留各分区前若干条，保证三个分区都在且总数恰为 target。
-    """
-    lines = md.split("\n")
-    preamble = []
-    i = 0
-    while i < len(lines):
-        if lines[i].lstrip().startswith("## "):
-            break
-        preamble.append(lines[i])
-        i += 1
-    sections = []  # [(header_line, [ [item_lines...] ])]
-    cur_header = None
-    cur_items = []
-    cur_item = []
-    while i < len(lines):
-        s = lines[i]
-        if s.lstrip().startswith("## "):
-            if cur_header is not None:
-                if cur_item:
-                    cur_items.append(cur_item)
-                sections.append((cur_header, cur_items))
-            cur_header = s
-            cur_items = []
-            cur_item = []
-        elif s.lstrip().startswith("### "):
-            if cur_item:
-                cur_items.append(cur_item)
-            cur_item = [s]
-        else:
-            if cur_item:
-                cur_item.append(s)
-        i += 1
-    if cur_header is not None:
-        if cur_item:
-            cur_items.append(cur_item)
-        sections.append((cur_header, cur_items))
 
-    total = sum(len(items) for _, items in sections)
-    if total <= target:
-        return md
+def merge_fragments(base_md, fragment_md):
+    """把补稿片段并入主体：按分区归位、去重、连续重编号。"""
+    preamble, base_sections = dedup.parse_report(base_md)
+    _, frag_sections = dedup.parse_report(fragment_md)
 
-    counts = [len(items) for _, items in sections]
-    quotas = [max(1, round(target * c / total)) for c in counts]
-    diff = target - sum(quotas)
-    k = len(quotas) - 1
-    while diff != 0 and k >= 0:
-        if diff > 0 and quotas[k] < counts[k]:
-            quotas[k] += 1
-            diff -= 1
-        elif diff < 0 and quotas[k] > 1:
-            quotas[k] -= 1
-            diff += 1
-        k -= 1
+    buckets = {0: [], 1: [], 2: []}
+    for sec in frag_sections:
+        idx = section_index(sec["header"])
+        if idx is not None and idx < 3:
+            buckets[idx].extend(sec["items"])
 
-    out = list(preamble)
-    num = 0
-    for (header, items), q in zip(sections, quotas):
-        if q <= 0:
-            continue
-        out.append(header)
-        for it in items[:q]:
-            num += 1
-            first = re.sub(r"^(###\s*)\d+", lambda m: m.group(1) + str(num), it[0])
-            out.append(first)
-            out.extend(it[1:])
-    return "\n".join(out)
+    new_sections = []
+    for sec in base_sections:
+        idx = section_index(sec["header"])
+        if idx is not None and idx < 3 and buckets[idx]:
+            sec = {"header": sec["header"], "items": sec["items"] + buckets[idx]}
+            buckets[idx] = []
+        new_sections.append(sec)
+    # 主体里没有的分区（极少见）按序补建
+    for idx, extra in buckets.items():
+        if extra:
+            name = ["AI 技术", "AI 应用", "AI 行业动态"][idx]
+            new_sections.append({"header": f"{SECTION_ORDINALS[idx]}、{name}", "items": extra})
+
+    return dedup.render_report(preamble, new_sections)
+
+
+def banned_block(history, extra_titles, extra_urls, limit=90):
+    """给补稿用的禁用清单：往期近期条目 + 本期全部条目（含已剔除的）。"""
+    lines = []
+    for t in extra_titles[:limit]:
+        lines.append(f"- [本期] {t}")
+    for u in extra_urls[:limit]:
+        lines.append(f"- [本期链接] {u}")
+    recent_titles = [t for t, _ in history.titles[-limit:]]
+    for t in recent_titles:
+        lines.append(f"- [往期] {t}")
+    return "\n".join(lines) or "（无）"
 
 
 def main():
+    print("=" * 66)
+    print(f"AI 资讯生成 | {DATE_STR} | 报告目录 {REPORT_DIR}")
+    print("=" * 66)
+
+    # 1) 全量历史（v1 只取最近 3 份，且因仓库无文件而恒为空）
+    history = dedup.load_history(REPORT_DIR, exclude={OUT_MD}, before=DATE)
+    print(f"历史基线：{len(history.files)} 期 / {len(history.titles)} 条标题 / "
+          f"{len(history.urls)} 条链接 / {len(history.fps)} 条事件指纹")
+    if not history.files:
+        print("  [warn] 未读到任何历史日报 —— 跨日去重将无基准。"
+              "请确认工作流已把历史日报提交回仓库（见 ai-news.yml 的 Commit report 步骤）")
+
+    # 2) 素材
     results = gather()
     context = build_context(results)
-    covered = load_covered(limit=3)
-    covered_block = "\n".join(f"- {it}" for it in covered) or "（无，本期为首期日报）"
-    user_msg = (PROMPT.replace("__DATE__", DATE_STR)
-                .replace("__CONTEXT__", context)
-                .replace("__DEDUP__", covered_block))
-    messages = [{"role": "user", "content": user_msg}]
-    resp = call_llm(messages)
-    text = resp["choices"][0]["message"]["content"]
-    if not text.strip():
-        raise SystemExit("ERROR: 模型未返回正文，可能网关不支持该模型或请求格式不符")
-    text = text.strip()
+    if not results:
+        raise SystemExit("ERROR: 未检索到任何素材，终止（避免凭空生成）")
+
+    # 3) 首轮生成
+    covered = []
+    for t, _ in history.titles[-HISTORY_PROMPT_LIMIT:]:
+        covered.append(t)
+    for u in list(history.urls)[-HISTORY_PROMPT_LIMIT:]:
+        covered.append(u)
+    covered_block = "\n".join(f"- {c}" for c in covered) or "（无，本期为首期）"
+    lo, hi = DATE - datetime.timedelta(days=1), DATE
+
+    text = call_llm(PROMPT.replace("__DATE__", DATE_STR)
+                    .replace("__CONTEXT__", context)
+                    .replace("__DEDUP__", covered_block)
+                    .replace("__LO__", str(lo)).replace("__HI__", str(hi)))
     if not text.lstrip().startswith("#"):
         text = f"# AI 资讯 24 小时 | {DATE_STR}\n\n" + text
-    text = enforce_count(text, 20)
-    with open(OUT_MD, "w", encoding="utf-8") as f:
+
+    # 4) 闸门 + 缺口自愈
+    dropped_all, final_items, final_sections = [], [], []
+    for rnd in range(1, MAX_REPAIR_ROUNDS + 1):
+        text, kept, dropped = dedup.filter_report(text, history, DATE)
+        if dropped:
+            dropped_all.extend(dropped)
+        errors, warns, final_items, final_sections = dedup.gate(
+            text, history, DATE, expected_total=None, expected_sections=None)
+        need, counts = deficits_of(final_sections)
+        print(f"[轮次 {rnd}] 保留 {len(final_items)} 条 分布 {counts} | "
+              f"本轮剔除 {len(dropped)} 条 | 残留错误 {len(errors)} 条 | 缺口 {need}")
+        for it, reason in dropped:
+            print(f"    × {reason} ← {it['title'][:38]}")
+        for e in errors:
+            print(f"    ! {e}")
+        if len(final_items) >= TARGET_TOTAL and not errors:
+            break
+        if rnd == MAX_REPAIR_ROUNDS:
+            break
+        if sum(need) == 0 and errors:
+            # 数量够但有硬错误（如日期超窗）→ 仍走补稿，让模型替换掉问题条目
+            need = [0, 0, 0]
+        want = [f"{SECTION_ORDINALS[i]}、{['AI 技术','AI 应用','AI 行业动态'][i]} 补 {need[i]} 条"
+                for i in range(3) if need[i] > 0]
+        if not want:
+            print("    → 无可补缺口，结束自愈")
+            break
+        frag = call_llm(TOPUP_PROMPT
+                        .replace("__BANNED__", banned_block(
+                            history,
+                            [i["title"] for i in final_items] + [i["title"] for i, _ in dropped_all],
+                            [i["url"] for i in final_items if i["url"]]))
+                        .replace("__NEED__", "\n".join(f"- {w}" for w in want))
+                        .replace("__CONTEXT__", context)
+                        .replace("__LO__", str(lo)).replace("__HI__", str(hi)))
+        text = merge_fragments(text, frag)
+
+    # 5) 终检：不合格就不产出（宁可当天不发，也不推重复内容）
+    errors, warns, final_items, final_sections = dedup.gate(
+        text, history, DATE, expected_total=None, expected_sections=None)
+    counts = [len(sec["items"]) for sec in final_sections]
+    print(f"终检：{len(final_items)} 条 | 分布 {counts} | 错误 {len(errors)} | 告警 {len(warns)}")
+    if len(final_items) != TARGET_TOTAL:
+        for path in (OUT_MD_PATH, os.path.join(REPORT_DIR, "index.html")):
+            if os.path.exists(path):
+                os.remove(path)
+        raise SystemExit(f"FAIL: 去重后仅 {len(final_items)} 条（要求 {TARGET_TOTAL}），"
+                         f"本轮不产出、不推送，避免发布重复内容")
+    if errors:
+        for e in errors:
+            print(f"  [ERROR] {e}")
+        raise SystemExit("FAIL: 仍存在硬性问题，本轮不产出、不推送")
+    for w in warns:
+        print(f"  [WARN] {w}")
+
+    with open(OUT_MD_PATH, "w", encoding="utf-8") as f:
         f.write(text)
-    with open("index.html", "w", encoding="utf-8") as f:
+    with open(os.path.join(REPORT_DIR, "index.html"), "w", encoding="utf-8") as f:
         f.write(md_to_html(text, DATE_STR))
-    print(f"OK: 已生成 {OUT_MD} ({len(text)} 字符, {count_items(text)} 条, 检索到 {len(results)} 条素材)")
+
+    print(f"OK: 已生成 {OUT_MD}（{len(final_items)} 条，分布 {counts}，"
+          f"剔除重复 {len(dropped_all)} 条，素材 {len(results)} 条）")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
