@@ -16,6 +16,9 @@ v2 的做法：
   3. **缺口自愈**：被丢弃的位置按分区向模型追加补稿，最多 3 轮；
      始终凑不满或仍有硬错误 → **退出码 1**（宁可当天不发，也不推重复内容）。
   4. 提示词里的"已覆盖集合"只是引导（截取近 N 条），真正的判定在本地代码里。
+  5. **自带回写**：出稿后由 `commit_report_back()` 用 `git` 把日报提交回仓库，
+     让下一期读到本期（跨日去重基线）。写在脚本里而非工作流里，是为了绕开
+     GitHub 「改 `.github/workflows/*` 需要 workflow 作用域」的限制，见该函数注释。
 
 环境变量
 --------
@@ -26,11 +29,14 @@ v2 的做法：
   REPORT_DIR          可选，日报所在目录（默认本脚本目录）
   HISTORY_PROMPT_LIMIT 可选，提示词中注入的历史条目上限（默认 240）
   MAX_REPAIR_ROUNDS   可选，补稿轮数上限（默认 3）
+  MIN_PUBLISH_TOTAL   可选，发布下限（默认 8）；不足 20 但 ≥ 此值即照发
+  NEWSHUB_COMMIT_BACK 可选，强制开启/关闭日报回写（CI 中默认开启）
 """
 
 import datetime
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -486,6 +492,90 @@ def trim_to_target(text, target, section_caps=None):
     return dedup.render_report(preamble, sections), before - after
 
 
+def _git(args, cwd, timeout=180):
+    p = subprocess.run(["git"] + args, cwd=cwd, capture_output=True,
+                       text=True, timeout=timeout)
+    return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+
+
+def commit_report_back(report_path, report_name, enabled=None):
+    """把当日日报提交回仓库，作为下一期的跨日去重基线。
+
+    为什么写在生成脚本里、而不是工作流里
+    ------------------------------------
+    GitHub 规定：创建或修改 `.github/workflows/*` 的凭据必须带 `workflow` 作用域，
+    否则 403（网页编辑器同样会被拒，报 "File could not be edited"）。本机 token 无
+    该作用域 → 无法往工作流里加"回写"步骤。于是把回写放进生成脚本本身 ——
+    工作流本来就会执行本脚本，限制被完全绕开：
+      · `actions/checkout@v4` 默认（persist-credentials）把 GITHUB_TOKEN 写进本地 git 配置；
+      · 本仓库 `default_workflow_permissions = write`，该 token 具备推送权限。
+    若将来工作流里也加了回写步骤，二者互不冲突：本函数发现"无变化"即退出。
+
+    任何一步失败都只打印告警，绝不影响当日出稿与 Pages 发布。
+    返回状态字符串：ok / nochange / skipped / nogit / notarget / missing /
+    commit-failed / push-failed / error
+    """
+    if enabled is None:
+        ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        flag = (os.environ.get("NEWSHUB_COMMIT_BACK") or "").lower()
+        enabled = ci or flag in ("1", "true", "yes", "force")
+    if not enabled:
+        print("[回写] 跳过（非 CI 环境且未显式开启；设 NEWSHUB_COMMIT_BACK=1 可强制）")
+        return "skipped"
+
+    if not os.path.exists(report_path):
+        print("[回写] 跳过：找不到日报文件")
+        return "missing"
+
+    try:
+        code, out, err = _git(["rev-parse", "--show-toplevel"], REPORT_DIR)
+        if code != 0:
+            print(f"[回写] 跳过：当前目录不是 git 仓库（{err[:120]}）")
+            return "nogit"
+        root = out.splitlines()[-1].strip()
+        rel = os.path.relpath(os.path.abspath(report_path), root).replace("\\", "/")
+        branch = os.environ.get("GITHUB_REF_NAME") or "main"
+
+        # 护栏：只认「真正属于本项目的仓库」。git 会一路向上找到最近的上层仓库，
+        # 若脚本被放到别的目录下运行，可能把日报误提交进不相干的仓库（实测用户主目录
+        # 就是一个 git repo）。本项目的标志是根下有 .github/workflows。
+        if not os.path.isdir(os.path.join(root, ".github", "workflows")):
+            print(f"[回写] 跳过：{root} 不是本项目仓库（根下无 .github/workflows）")
+            return "notarget"
+
+        # 浅克隆（checkout 默认 fetch-depth: 1）直接 push 可能被拒，先补全历史
+        if _git(["fetch", "--unshallow"], root)[0] != 0:
+            _git(["fetch", "--depth=100", "origin", branch], root)
+
+        _git(["config", "user.name", "github-actions[bot]"], root)
+        _git(["config", "user.email",
+              "41898282+github-actions[bot]@users.noreply.github.com"], root)
+
+        _git(["add", "--", rel], root)
+        code, out, _ = _git(["status", "--porcelain", "--", rel], root)
+        if code != 0 or not out.strip():
+            print("[回写] 日报无变化（可能已由工作流步骤提交），无需重复入库")
+            return "nochange"
+
+        msg = f"chore(news): 入库 {report_name}（跨日去重基线）"
+        code, _, err = _git(["commit", "-m", msg, "--", rel], root)
+        if code != 0:
+            print(f"[回写] commit 失败：{err[:200]}")
+            return "commit-failed"
+
+        code, _, err = _git(["push", "origin", f"HEAD:{branch}"], root)
+        if code != 0:
+            print(f"[回写] push 失败：{err[:200]}"
+                  f"\n       本期日报已正常发布，但去重基线本期未更新")
+            return "push-failed"
+
+        print(f"[回写] 已入库并推送：{rel} → {branch}")
+        return "ok"
+    except Exception as e:  # noqa: BLE001
+        print(f"[回写] 异常（已忽略，不影响出稿）：{type(e).__name__}: {e}")
+        return "error"
+
+
 def main():
     print("=" * 66)
     print(f"AI 资讯生成 | {DATE_STR} | 报告目录 {REPORT_DIR}")
@@ -592,6 +682,9 @@ def main():
 
     print(f"OK: 已生成 {OUT_MD}（{len(final_items)} 条，分布 {counts}，"
           f"剔除重复 {len(dropped_all)} 条，素材 {len(results)} 条）")
+
+    # 6) 回写仓库：让下一期读到本期，跨日去重基线才活得起来
+    commit_report_back(OUT_MD_PATH, OUT_MD)
     return 0
 
 
