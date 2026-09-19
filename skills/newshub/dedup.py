@@ -28,12 +28,14 @@
 判定规则
 --------
 E2  本期内部链接不得重复
-E3  链接不得与全部历史重复（标【进展更新】降级为 WARN）
+E3  链接不得与全部历史重复 —— **不接受【进展更新】豁免**（同链接 = 同一篇文章）
 E4  发布日期须在 [D-1, D]（无日期或“近日”按 WARN 处理）
 E5  每条须有标题 / 链接 / 来源 / 正文
 E7  事件链指纹去重：期内 + 全部历史（厂商×动作×金额 / 标题 2-gram≥0.45）
+    —— 允许标【进展更新】豁免（同一事件链确有新数字/新状态）
 E8  单期同一厂商 ≤2 条
 E9  标题相似度去重：与任一条历史标题 2-gram Jaccard ≥0.65 即判重（**厂商无关**）
+    —— 允许标【进展更新】豁免（同事件的新进展标题天然相似）
 """
 
 import datetime
@@ -356,15 +358,12 @@ def gate(text, history=None, day=None, expected_total=20, expected_sections=None
         else:
             seen[u] = i
 
-    # E3 跨历史链接重复
+    # E3 跨历史链接重复（不接受【进展更新】豁免：同链接即同一篇文章）
     for i, it in enumerate(items, 1):
         u = it["url"]
         if u and u in history.urls:
-            msg = (f"E3 与往期重复链接（往期 {history.urls[u]}）：{u} → {it['title'][:34]}")
-            if PROGRESS_TAG in (it["title"] or ""):
-                warnings.append("已标注【进展更新】，不阻断 —— " + msg)
-            else:
-                errors.append(msg)
+            errors.append(f"E3 与往期重复链接（往期 {history.urls[u]}）："
+                          f"{u} → {it['title'][:34]}")
 
     # E7a 期内事件链重复
     for i in range(len(items)):
@@ -464,7 +463,10 @@ def _violation(it, history, kept, kept_urls, vendor_count, day, max_per_vendor):
 
     if it["url"] in kept_urls:
         return "本期链接重复"
-    if it["url"] in history.urls and not progress:
+    # 链接是「文章身份」，与事件链无关：同一条链接被再次使用，永远是同一篇文章，
+    # 不存在「新进展」的可能。因此这里**不接受**【进展更新】豁免（2026-09-19 线上
+    # 审计发现：带该标注的条目可把同一 URL 重发出去，正是「同链接复用」病态）。
+    if it["url"] in history.urls:
         return f"与往期链接重复（{history.urls[it['url']]}）"
 
     fp = fingerprint(title, it["body"])

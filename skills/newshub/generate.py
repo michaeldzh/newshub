@@ -14,7 +14,9 @@ v2 的做法：
   2. **确定性闸门**：生成后用 dedup.filter_report 硬性丢弃重复与超限条目，
      不依赖模型是否听话。
   3. **缺口自愈**：被丢弃的位置按分区向模型追加补稿，最多 3 轮；
-     始终凑不满或仍有硬错误 → **退出码 1**（宁可当天不发，也不推重复内容）。
+     补稿本身失败（限流/网关抖动）**不阻断出稿** —— 既有内容已过闸门，
+     按「不足也照发」继续（线上事故 2026-09-19：一次 429 让整天白跑）。
+     仅当条数低于下限，或仍存在硬错误（重复/超窗等），才以退出码 1 终止。
   4. 提示词里的"已覆盖集合"只是引导（截取近 N 条），真正的判定在本地代码里。
   5. **自带回写**：出稿后由 `commit_report_back()` 用 `git` 把日报提交回仓库，
      让下一期读到本期（跨日去重基线）。写在脚本里而非工作流里，是为了绕开
@@ -38,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 
 import requests
@@ -333,21 +336,60 @@ __CONTEXT__
 """
 
 
-def call_llm(user_msg, max_tokens=8000):
-    resp = requests.post(
-        CHAT_ENDPOINT,
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-        json={"model": MODEL, "max_tokens": max_tokens,
-              "messages": [{"role": "user", "content": user_msg}],
-              "temperature": 0.3},
-        timeout=300,
-    )
-    if resp.status_code != 200:
-        raise SystemExit(f"ERROR: LLM 调用失败 {resp.status_code}: {resp.text[:500]}")
-    text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-    if not text:
-        raise SystemExit("ERROR: 模型未返回正文（网关可能不支持该模型）")
-    return text
+# 可重试的 HTTP 状态：限流与网关类瞬时故障。免费/低档套餐很容易撞上 429，
+# 一次抖动就让整天不出稿并不划算，因此先退避重试再决定是否放弃。
+RETRY_STATUS = {429, 500, 502, 503, 504}
+RETRY_BACKOFF = [5, 15, 30]          # 秒，最多重试 len(RETRY_BACKOFF) 次
+
+
+def call_llm(user_msg, max_tokens=8000, soft=False):
+    """调用 LLM。瞬时限流/网关错误会退避重试。
+
+    soft=False（默认）：最终仍失败则抛 SystemExit —— 用于首轮生成，
+      此时没有任何可发布内容，终止是正确行为。
+    soft=True：最终仍失败返回 None —— 用于「补稿」轮。补稿只是锦上添花，
+      不能因为一次 429 就把已经合格的内容整期丢掉（2026-09-19 线上事故）。
+    """
+    last = "未知错误"
+    for attempt in range(len(RETRY_BACKOFF) + 1):
+        if attempt:
+            wait = RETRY_BACKOFF[attempt - 1]
+            print(f"  [warn] LLM 调用重试 {attempt}/{len(RETRY_BACKOFF)}，"
+                  f"{wait}s 后重试（{last[:120]}）")
+            time.sleep(wait)
+        try:
+            resp = requests.post(
+                CHAT_ENDPOINT,
+                headers={"Authorization": f"Bearer {API_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": MODEL, "max_tokens": max_tokens,
+                      "messages": [{"role": "user", "content": user_msg}],
+                      "temperature": 0.3},
+                timeout=300,
+            )
+        except Exception as e:  # noqa: BLE001 —— 网络抖动同样值得重试
+            last = f"{type(e).__name__}: {e}"
+            if attempt == len(RETRY_BACKOFF):
+                break
+            continue
+        if resp.status_code in RETRY_STATUS:
+            last = f"{resp.status_code}: {resp.text[:300]}"
+            if attempt == len(RETRY_BACKOFF):
+                break
+            continue
+        if resp.status_code != 200:
+            last = f"{resp.status_code}: {resp.text[:300]}"
+            break                      # 4xx 业务错误（如模型名不对）重试无意义
+        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        if not text:
+            last = "模型未返回正文（网关可能不支持该模型）"
+            break
+        return text
+
+    if soft:
+        print(f"  [warn] LLM 调用最终失败，跳过本次补稿：{last[:200]}")
+        return None
+    raise SystemExit(f"ERROR: LLM 调用失败：{last[:500]}")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -645,7 +687,14 @@ def main():
                             [i["url"] for i in final_items if i["url"]]))
                         .replace("__NEED__", "\n".join(f"- {w}" for w in want))
                         .replace("__CONTEXT__", context)
-                        .replace("__LO__", str(lo)).replace("__HI__", str(hi)))
+                        .replace("__LO__", str(lo)).replace("__HI__", str(hi)),
+                        soft=True)
+        if frag is None:
+            # 补稿失败（限流等）不应拖垮整期：现有内容已过闸门，按「不足也照发」
+            # 继续走到终检。缺口条目留待后续期正常复用。
+            print(f"  [warn] 补稿失败，停止自愈；以现有 {len(final_items)} 条继续出稿"
+                  f"（缺口 {need}，将在后续期补上）")
+            break
         text = merge_fragments(text, frag)
 
     # 5) 终检：目标 20 条，不足也照发；仅低于下限或存在硬错误才不出稿
