@@ -287,10 +287,16 @@ def _date_ok(d, day):
     return (lo <= d <= hi), f"窗口 {lo} ~ {hi}"
 
 
-def gate(text, history=None, day=None, expected_total=20, expected_sections=None):
+def gate(text, history=None, day=None, expected_total=20, expected_sections=None,
+         min_total=None):
     """逐项校验，返回 (errors, warnings, items, sections)。
 
     history 为 History 实例或 None；day 为日报日期（None 则跳过 E4）。
+
+    expected_total / expected_sections 为**目标值**。传入 min_total 后语义变为
+    「目标 20 条，但不足也照发」：条目数 ≥ min_total 时缺口只报 WARN 不阻断；
+    低于 min_total 或超出目标上限才判 ERROR（前者代表检索/生成链路异常）。
+    min_total 为 None 时保持严格语义（必须恰为目标数）。
     """
     errors, warnings = [], []
     history = history or History()
@@ -312,12 +318,32 @@ def gate(text, history=None, day=None, expected_total=20, expected_sections=None
             errors.append(f"E5 第 {i} 条缺失要素：{'/'.join(missing)} → {it['title'][:36]}")
 
     # E1 / E6 数量与分区
-    if expected_total is not None and len(items) != expected_total:
-        errors.append(f"E1 条目数为 {len(items)}，要求恰为 {expected_total}")
+    #   发布策略：目标 20 条（7/7/6），但「不足也照发」—— 只要不低于 min_total，
+    #   缺口仅报 WARN，不阻断出稿，避免因去重后缺口整天不发。
+    n_items = len(items)
+    if expected_total is not None:
+        if min_total is not None:
+            if n_items > expected_total:
+                errors.append(f"E1 条目数为 {n_items}，超出上限 {expected_total}")
+            elif n_items < min_total:
+                errors.append(f"E1 条目数仅 {n_items}，低于发布下限 {min_total}"
+                              f"（检索或生成链路可能异常，请先排查素材源）")
+            elif n_items < expected_total:
+                warnings.append(f"E1 条目数 {n_items} < 目标 {expected_total}："
+                                f"去重后缺口已尽力补齐，按「不足也照发」策略放行")
+        elif n_items != expected_total:
+            errors.append(f"E1 条目数为 {n_items}，要求恰为 {expected_total}")
     if expected_sections is not None:
-        counts = [len(sec["items"]) for sec in sections]
-        if counts != expected_sections:
-            errors.append(f"E6 分类分布为 {counts}，要求 {expected_sections}")
+        # 忽略无条目的收尾分区（如「关键发现」），只统计真正装条目的分区
+        counts = [len(sec["items"]) for sec in sections if sec["items"]]
+        if counts == expected_sections:
+            pass
+        elif (len(counts) <= len(expected_sections)
+              and all(c <= t for c, t in zip(counts, expected_sections))):
+            warnings.append(f"E6 分类分布为 {counts}，未达目标 {expected_sections}"
+                            f"（各分区均未超上限，放行）")
+        else:
+            errors.append(f"E6 分类分布为 {counts}，要求不超过 {expected_sections}")
 
     # E2 期内链接重复
     seen = {}

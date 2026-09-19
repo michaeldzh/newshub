@@ -12,11 +12,12 @@
 
 检查项（任一 ERROR 即 FAIL，退出码 1）
 --------------------------------------
-E1  条目数必须恰为 20
+E1  条目数目标 20，**不足也照发**：低于 MIN_TOTAL（默认 8）判 ERROR，8–19 条仅 WARN
 E2  本期内部原文链接不得重复
 E3  原文链接不得与**全部历史**重复（标【进展更新】降级为 WARN）
 E4  发布日期须落在 [D-1, D]（D = 日报文件名日期）
 E5  每条须有标题 / 原文链接 / 来源 / 正文
+E6  分区目标 7/7/6：未达目标但各分区均未超上限 → WARN；有分区超上限 → ERROR
 E7  事件链指纹去重：期内 + 全部历史（厂商×动作×金额 / 标题 2-gram ≥0.45）
 E8  单期同一厂商 ≤2 条
 E9  标题相似度去重：与任一条历史标题 2-gram Jaccard ≥0.65（厂商无关）
@@ -43,6 +44,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 EXPECTED_TOTAL = 20
 EXPECTED_SECTIONS = [7, 7, 6]
+# 发布下限：目标 20 条，但「不足也照发」；低于此值才判 FAIL（代表链路异常）。可用 MIN_TOTAL 覆盖。
+MIN_TOTAL = int(os.environ.get("MIN_TOTAL") or 8)
 
 
 def find_report_dir(explicit_file=None):
@@ -93,7 +96,8 @@ def check_one(path, reports, report_dir):
 
     errors, warnings, items, sections = dedup.gate(
         text, history, day,
-        expected_total=EXPECTED_TOTAL, expected_sections=EXPECTED_SECTIONS)
+        expected_total=EXPECTED_TOTAL, expected_sections=EXPECTED_SECTIONS,
+        min_total=MIN_TOTAL)
 
     print(f"\n{'=' * 62}")
     print(f"{name}  ->  {'PASS' if not errors else 'FAIL'}")

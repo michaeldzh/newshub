@@ -47,6 +47,8 @@ HISTORY_PROMPT_LIMIT = int(os.environ.get("HISTORY_PROMPT_LIMIT") or 240)
 MAX_REPAIR_ROUNDS = int(os.environ.get("MAX_REPAIR_ROUNDS") or 3)
 TARGET_TOTAL = 20
 TARGET_SECTIONS = [7, 7, 6]
+# 发布下限：目标 20 条，但不足也照发；低于此值才判定链路异常、不出稿。
+MIN_PUBLISH_TOTAL = int(os.environ.get("MIN_PUBLISH_TOTAL") or 8)
 SECTION_ORDINALS = "一二三四"
 
 if not API_KEY:
@@ -457,6 +459,33 @@ def banned_block(history, extra_titles, extra_urls, limit=90):
     return "\n".join(lines) or "（无）"
 
 
+def trim_to_target(text, target, section_caps=None):
+    """条目数超量时截去多余条目，返回 (新文本, 截掉条数)。
+
+    先按分区上限（section_caps，如 7/7/6）削平超量分区，再从末尾分区往前截，
+    确保「各分区不得超上限」这条硬约束不会因截尾而破。模型偶尔多给几条时，
+    截尾比整期不出稿划算。
+    """
+    preamble, sections = dedup.parse_report(text)
+    before = sum(len(s["items"]) for s in sections)
+    if section_caps:
+        for i, cap in enumerate(section_caps):
+            if i < len(sections) and len(sections[i]["items"]) > cap:
+                sections[i]["items"] = sections[i]["items"][:cap]
+    over = sum(len(s["items"]) for s in sections) - target
+    for idx in range(len(sections) - 1, -1, -1):
+        if over <= 0:
+            break
+        take = min(over, len(sections[idx]["items"]))
+        if take:
+            sections[idx]["items"] = sections[idx]["items"][:-take]
+            over -= take
+    after = sum(len(s["items"]) for s in sections)
+    if after == before:
+        return text, 0
+    return dedup.render_report(preamble, sections), before - after
+
+
 def main():
     print("=" * 66)
     print(f"AI 资讯生成 | {DATE_STR} | 报告目录 {REPORT_DIR}")
@@ -529,17 +558,26 @@ def main():
                         .replace("__LO__", str(lo)).replace("__HI__", str(hi)))
         text = merge_fragments(text, frag)
 
-    # 5) 终检：不合格就不产出（宁可当天不发，也不推重复内容）
+    # 5) 终检：目标 20 条，不足也照发；仅低于下限或存在硬错误才不出稿
+    #    超出目标先截尾（保持各分区不超上限），避免模型多给两条就整天不发
+    text, trimmed = trim_to_target(text, TARGET_TOTAL, TARGET_SECTIONS)
+    if trimmed:
+        print(f"  [info] 超出目标，已截尾 {trimmed} 条至 {TARGET_TOTAL} 条")
+
     errors, warns, final_items, final_sections = dedup.gate(
-        text, history, DATE, expected_total=None, expected_sections=None)
+        text, history, DATE, expected_total=TARGET_TOTAL,
+        expected_sections=TARGET_SECTIONS, min_total=MIN_PUBLISH_TOTAL)
     counts = [len(sec["items"]) for sec in final_sections]
     print(f"终检：{len(final_items)} 条 | 分布 {counts} | 错误 {len(errors)} | 告警 {len(warns)}")
-    if len(final_items) != TARGET_TOTAL:
+    if len(final_items) < MIN_PUBLISH_TOTAL:
         for path in (OUT_MD_PATH, os.path.join(REPORT_DIR, "index.html")):
             if os.path.exists(path):
                 os.remove(path)
-        raise SystemExit(f"FAIL: 去重后仅 {len(final_items)} 条（要求 {TARGET_TOTAL}），"
-                         f"本轮不产出、不推送，避免发布重复内容")
+        raise SystemExit(f"FAIL: 去重后仅 {len(final_items)} 条，低于发布下限 "
+                         f"{MIN_PUBLISH_TOTAL}，本轮不产出（请排查素材源与模型输出）")
+    if len(final_items) < TARGET_TOTAL:
+        print(f"  [WARN] 仅 {len(final_items)} 条（目标 {TARGET_TOTAL}）—— "
+              f"按「不足也照发」策略放行，本期缺口条目之后可正常复用")
     if errors:
         for e in errors:
             print(f"  [ERROR] {e}")
