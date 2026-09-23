@@ -12,7 +12,7 @@
 
 检查项（任一 ERROR 即 FAIL，退出码 1）
 --------------------------------------
-E1  条目数目标 20，**不足也照发**：低于 MIN_TOTAL（默认 8）判 ERROR，8–19 条仅 WARN
+E1  条目数目标 20，**不足也照发**：低于 MIN_TOTAL（默认 3）判 ERROR，3–19 条仅 WARN
 E2  本期内部原文链接不得重复
 E3  原文链接不得与**全部历史**重复（标【进展更新】降级为 WARN）
 E4  发布日期须落在 [D-1, D]（D = 日报文件名日期）
@@ -45,7 +45,7 @@ if hasattr(sys.stderr, "reconfigure"):
 EXPECTED_TOTAL = 20
 EXPECTED_SECTIONS = [7, 7, 6]
 # 发布下限：目标 20 条，但「不足也照发」；低于此值才判 FAIL（代表链路异常）。可用 MIN_TOTAL 覆盖。
-MIN_TOTAL = int(os.environ.get("MIN_TOTAL") or 8)
+MIN_TOTAL = int(os.environ.get("MIN_TOTAL") or 3)
 
 
 def find_report_dir(explicit_file=None):

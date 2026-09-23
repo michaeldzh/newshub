@@ -11,14 +11,18 @@ v1 的去重是「软」的：把最近 3 份日报的标题/链接塞进提示�
 v2 的做法：
   1. **全量历史**：读取报告目录下全部 `AI资讯24小时_*.md`（不再只取最近 3 份），
      汇总链接 / 标题 / 事件指纹（见 dedup.py）。
-  2. **确定性闸门**：生成后用 dedup.filter_report 硬性丢弃重复与超限条目，
+  2. **素材预筛**（2026-09-23 新增，事故根因修复）：`prefilter_materials()` 在
+     送进提示词之前，就用全历史把「已覆盖 / 明显超窗」的素材剔掉。此前模型每轮
+     都给满 20 条、却有 14–15 条是老文章，只能在闸门阶段丢弃，去重后仅剩 5–6 条，
+     再撞上补稿限流就整天不出稿。判据与闸门完全一致，因此不会误杀闸门本会保留的条目。
+  3. **确定性闸门**：生成后用 dedup.filter_report 硬性丢弃重复与超限条目，
      不依赖模型是否听话。
-  3. **缺口自愈**：被丢弃的位置按分区向模型追加补稿，最多 3 轮；
+  4. **缺口自愈**：被丢弃的位置按分区向模型追加补稿，最多 3 轮；
      补稿本身失败（限流/网关抖动）**不阻断出稿** —— 既有内容已过闸门，
      按「不足也照发」继续（线上事故 2026-09-19：一次 429 让整天白跑）。
      仅当条数低于下限，或仍存在硬错误（重复/超窗等），才以退出码 1 终止。
-  4. 提示词里的"已覆盖集合"只是引导（截取近 N 条），真正的判定在本地代码里。
-  5. **自带回写**：出稿后由 `commit_report_back()` 用 `git` 把日报提交回仓库，
+  5. 提示词里的"已覆盖集合"只是引导（截取近 N 条），真正的判定在本地代码里。
+  6. **自带回写**：出稿后由 `commit_report_back()` 用 `git` 把日报提交回仓库，
      让下一期读到本期（跨日去重基线）。写在脚本里而非工作流里，是为了绕开
      GitHub 「改 `.github/workflows/*` 需要 workflow 作用域」的限制，见该函数注释。
 
@@ -31,7 +35,8 @@ v2 的做法：
   REPORT_DIR          可选，日报所在目录（默认本脚本目录）
   HISTORY_PROMPT_LIMIT 可选，提示词中注入的历史条目上限（默认 240）
   MAX_REPAIR_ROUNDS   可选，补稿轮数上限（默认 3）
-  MIN_PUBLISH_TOTAL   可选，发布下限（默认 8）；不足 20 但 ≥ 此值即照发
+  MATERIAL_LIMIT      可选，预筛后送进提示词的素材上限（默认 120）
+  MIN_PUBLISH_TOTAL   可选，发布下限（默认 3）；不足 20 但 ≥ 此值即照发
   NEWSHUB_COMMIT_BACK 可选，强制开启/关闭日报回写（CI 中默认开启）
 """
 
@@ -56,8 +61,11 @@ HISTORY_PROMPT_LIMIT = int(os.environ.get("HISTORY_PROMPT_LIMIT") or 240)
 MAX_REPAIR_ROUNDS = int(os.environ.get("MAX_REPAIR_ROUNDS") or 3)
 TARGET_TOTAL = 20
 TARGET_SECTIONS = [7, 7, 6]
-# 发布下限：目标 20 条，但不足也照发；低于此值才判定链路异常、不出稿。
-MIN_PUBLISH_TOTAL = int(os.environ.get("MIN_PUBLISH_TOTAL") or 8)
+# 发布下限：目标 20 条，但不足也照发（用户 2026-09-19 明确要求）；
+# 低于此值才判定检索/生成链路异常、当天不出稿。
+MIN_PUBLISH_TOTAL = int(os.environ.get("MIN_PUBLISH_TOTAL") or 3)
+# 预筛后送进提示词的素材上限
+MATERIAL_LIMIT = int(os.environ.get("MATERIAL_LIMIT") or 120)
 SECTION_ORDINALS = "一二三四"
 
 if not API_KEY:
@@ -263,7 +271,9 @@ def gather():
                 all_res.append(it)
                 n += 1
         print(f"query={q!r} -> {n} new")
-    return all_res[:120]
+    # 不在这一步截断：先交给 prefilter_materials 剔除已覆盖素材，再按上限取，
+    # 否则陈旧素材会挤掉后面的新鲜素材。
+    return all_res
 
 
 def build_context(results):
@@ -272,6 +282,114 @@ def build_context(results):
         f"摘要：{it.get('content', '')}\n"
         for i, it in enumerate(results, 1)
     )
+
+
+# 素材日期解析：RSS 用 RFC822（Mon, 22 Sep 2026 10:00:00 GMT），
+# Tavily 用 ISO（2026-09-22T10:00:00Z）。解析不出就返回 None（不去判断）。
+MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+          "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+def material_date(raw):
+    s = (raw or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})", s)
+    if m and m.group(2).lower() in MONTHS:
+        try:
+            return datetime.date(int(m.group(3)), MONTHS[m.group(2).lower()],
+                                 int(m.group(1)))
+        except ValueError:
+            return None
+    return None
+
+
+def prefilter_materials(results, history):
+    """送进提示词之前，就把「往期已覆盖 / 明显超窗」的素材剔掉。
+
+    为什么必须做（2026-09-23、09-20 两次线上事故的根因）：
+    模型每轮都给满 20 条，但其中 14–15 条是搜索引擎翻出来的**老文章**
+    （9/5、9/6、9/8、8/18、8/21 那几期已发过的），只能在闸门阶段逐条丢弃，
+    于是去重后只剩 5–6 条；再撞上补稿时的 LLM 限流（429），当天干脆不出稿。
+
+    而这些判定在送稿前就是**确定性可算**的——链接是否在全历史出现过、
+    标题是否与历史标题高度相似、事件指纹是否命中。先剔除，模型就只在
+    「真新」的素材里挑，缺口自然收敛，同时大幅减少对补稿轮次的依赖。
+
+    注意：这里用的三个判据与闸门 `filter_report` 完全一致（同阈值、同函数），
+    因此**不会误杀闸门本会保留的条目**，只是把丢弃提前到提示词之前。
+    返回 (保留素材, [(素材, 原因), ...])。
+    """
+    kept, dropped = [], []
+    # 日期窗口比闸门 [D-1, D] 略宽：留出余地，避免把跨时区/刚过窗的素材误杀
+    floor = DATE - datetime.timedelta(days=2)
+    # 历史标题的字集预先算一次（不变），避免「素材数 × 历史标题数」次重复计算
+    hist_title_grams = [(dedup._grams(ht), ht, hf) for ht, hf in history.titles]
+
+    for it in results:
+        title = (it.get("title") or "").strip()
+        url = (it.get("url") or "").strip()
+        body = it.get("content") or ""
+        if not title:
+            dropped.append((it, "素材无标题"))
+            continue
+
+        # ① 链接级：同一 URL 即同一篇文章，绝无「新进展」的可能
+        if url and url in history.urls:
+            dropped.append((it, f"链接已覆盖（{history.urls[url]}）"))
+            continue
+
+        # ② 标题级：厂商无关的用字重合，拦「换媒体重发同一事件」
+        #    （与闸门一致：标题含【进展更新】者豁免语义判重，但不豁免链接判重）
+        progress = dedup.PROGRESS_TAG in title
+        hit_title = None
+        if not progress:
+            g = None
+            for h_grams, h_title, h_file in hist_title_grams:
+                if g is None:
+                    g = dedup._grams(title)
+                if dedup.title_similarity(title, h_title,
+                                          grams_a=g, grams_b=h_grams) >= dedup.TITLE_SIM_THRESHOLD:
+                    hit_title = (h_title, h_file)
+                    break
+        if hit_title:
+            dropped.append((it, f"标题近似已覆盖（{hit_title[1]}）"))
+            continue
+
+        # ③ 事件链级：厂商×动作×金额/对象用字
+        hit_fp = None
+        if not progress:
+            fp = dedup.fingerprint(title, body)
+            for h_fp, h_title, h_file in history.fps:
+                if dedup.is_dup_event(fp, h_fp):
+                    hit_fp = (h_title, h_file)
+                    break
+        if hit_fp:
+            dropped.append((it, f"事件链已覆盖（{hit_fp[1]}）"))
+            continue
+
+        # ④ 时效：能解析出日期且明显早于窗口的，闸门也会判超窗，提前去掉
+        d = material_date(it.get("published"))
+        if d is not None and d < floor:
+            dropped.append((it, f"发布日期超窗（{d}）"))
+            continue
+
+        kept.append(it)
+
+    # 新鲜素材优先：有日期的按日期倒序排在前面，无日期的保持原序垫后。
+    # gather() 之后要按上限截断，这样被截掉的是最陈旧的而不是最新的。
+    def _sort_key(pair):
+        d = material_date(pair[1].get("published"))
+        return (0, -d.toordinal()) if d else (1, 0)
+
+    kept = [it for _, it in sorted(enumerate(kept), key=lambda p: _sort_key(p))]
+    return kept, dropped
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -339,7 +457,9 @@ __CONTEXT__
 # 可重试的 HTTP 状态：限流与网关类瞬时故障。免费/低档套餐很容易撞上 429，
 # 一次抖动就让整天不出稿并不划算，因此先退避重试再决定是否放弃。
 RETRY_STATUS = {429, 500, 502, 503, 504}
-RETRY_BACKOFF = [5, 15, 30]          # 秒，最多重试 len(RETRY_BACKOFF) 次
+# 秒。免费档的速率限制按时间窗计算，5/15/30 那点等待根本不够（2026-09-23 实测
+# 三轮退避全被 429 挡回，补稿直接失败）——拉到累计 ~3 分钟才能跨过限流窗口。
+RETRY_BACKOFF = [10, 30, 60, 90]
 
 
 def call_llm(user_msg, max_tokens=8000, soft=False):
@@ -631,11 +751,19 @@ def main():
         print("  [warn] 未读到任何历史日报 —— 跨日去重将无基准。"
               "请确认工作流已把历史日报提交回仓库（见 ai-news.yml 的 Commit report 步骤）")
 
-    # 2) 素材
-    results = gather()
+    # 2) 素材：先用全历史做确定性预筛，再送进提示词
+    raw_results = gather()
+    results, pre_dropped = prefilter_materials(raw_results, history)
+    print(f"素材预筛：{len(raw_results)} 条 -> 保留 {len(results)} 条 "
+          f"（剔除已覆盖/超窗 {len(pre_dropped)} 条）")
+    for it, reason in pre_dropped[:12]:
+        print(f"    - {reason} ← {(it.get('title') or '')[:36]}")
+    if len(pre_dropped) > 12:
+        print(f"    … 另有 {len(pre_dropped) - 12} 条同类剔除")
+    results = results[:MATERIAL_LIMIT]
     context = build_context(results)
     if not results:
-        raise SystemExit("ERROR: 未检索到任何素材，终止（避免凭空生成）")
+        raise SystemExit("ERROR: 素材预筛后无可用素材，终止（避免凭空生成）")
 
     # 3) 首轮生成
     covered = []
