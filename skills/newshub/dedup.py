@@ -211,9 +211,15 @@ def is_dup_event(fp_new, fp_old):
     return False
 
 
-def title_similarity(a, b):
-    """两标题的 2-gram Jaccard 相似度（厂商无关）。"""
-    g1, g2 = _grams(a), _grams(b)
+def title_similarity(a, b, grams_a=None, grams_b=None):
+    """两标题的 2-gram Jaccard 相似度（厂商无关）。
+
+    grams_a / grams_b 可传入预先算好的 `_grams()` 结果。批量比对（如素材预筛要拿
+    N 条素材 × M 条历史标题）时，历史那一侧的字集是不变的，预先算一次能省掉绝大部分
+    开销；公式仍然只有这一处实现，避免出现第二份"看起来一样"的判定逻辑。
+    """
+    g1 = _grams(a) if grams_a is None else grams_a
+    g2 = _grams(b) if grams_b is None else grams_b
     if not g1 or not g2:
         return 0.0
     return len(g1 & g2) / len(g1 | g2)
