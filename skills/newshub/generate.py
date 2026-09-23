@@ -36,16 +36,19 @@ v2 的做法：
   HISTORY_PROMPT_LIMIT 可选，提示词中注入的历史条目上限（默认 240）
   MAX_REPAIR_ROUNDS   可选，补稿轮数上限（默认 3）
   MATERIAL_LIMIT      可选，预筛后送进提示词的素材上限（默认 120）
-  MIN_PUBLISH_TOTAL   可选，发布下限（默认 3）；不足 20 但 ≥ 此值即照发
+  MIN_PUBLISH_TOTAL   可选，发布下限（默认 1）；不足 20 但 ≥ 此值即照发
   NEWSHUB_COMMIT_BACK 可选，强制开启/关闭日报回写（CI 中默认开启）
+  NEWSHUB_ALERT       可选，置 0/false 关闭失败兜底（默认开启）
 """
 
 import datetime
+import json
 import os
 import re
 import subprocess
 import sys
 import time
+import traceback
 import xml.etree.ElementTree as ET
 
 import requests
@@ -61,15 +64,26 @@ HISTORY_PROMPT_LIMIT = int(os.environ.get("HISTORY_PROMPT_LIMIT") or 240)
 MAX_REPAIR_ROUNDS = int(os.environ.get("MAX_REPAIR_ROUNDS") or 3)
 TARGET_TOTAL = 20
 TARGET_SECTIONS = [7, 7, 6]
-# 发布下限：目标 20 条，但不足也照发（用户 2026-09-19 明确要求）；
-# 低于此值才判定检索/生成链路异常、当天不出稿。
-MIN_PUBLISH_TOTAL = int(os.environ.get("MIN_PUBLISH_TOTAL") or 3)
+# 发布下限：目标 20 条，但不足也照发（用户 2026-09-19 明确要求，2026-09-23 由 3 收到 1）。
+# 下限的职责只是「拦住 0 条 / 硬错误」这类链路异常 —— 素材少是常态，不该整天不出稿；
+# 真正的故障由下面的 emit_alert() 兜底送达，而不是靠「不发」来体现。
+MIN_PUBLISH_TOTAL = int(os.environ.get("MIN_PUBLISH_TOTAL") or 1)
 # 预筛后送进提示词的素材上限
 MATERIAL_LIMIT = int(os.environ.get("MATERIAL_LIMIT") or 120)
 SECTION_ORDINALS = "一二三四"
+# 故障通报文件名（仓库内可见，且是「上一轮是否失败」的机器可读判据）
+ALERT_NAME = "ALERT.json"
 
-if not API_KEY:
-    raise SystemExit("ERROR: 环境变量 ANTHROPIC_API_KEY 未设置")
+
+def _require_api_key():
+    """把 key 校验从 import 期挪到主流程内。
+
+    原来写在模块顶层，缺 key 时进程在 import 阶段就退出 —— 那时 main() 还没进来，
+    兜底通报永远不会生成，等于又回到静默失败。
+    """
+    if not API_KEY:
+        raise SystemExit("ERROR: 环境变量 ANTHROPIC_API_KEY 未设置"
+                         "（GitHub 仓库 Settings → Secrets 里检查 ANTHROPIC_API_KEY）")
 
 DATE = datetime.date.today()
 DATE_STR = f"{DATE.year}年{DATE.month}月{DATE.day}日"
@@ -660,6 +674,88 @@ def _git(args, cwd, timeout=180):
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
 
 
+def _commit_enabled(enabled):
+    if enabled is None:
+        ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+        flag = (os.environ.get("NEWSHUB_COMMIT_BACK") or "").lower()
+        enabled = ci or flag in ("1", "true", "yes", "force")
+    return enabled
+
+
+def _repo_root():
+    """定位本项目仓库根。返回 (root, 状态)，状态为 ok / nogit / notarget。"""
+    code, out, err = _git(["rev-parse", "--show-toplevel"], REPORT_DIR)
+    if code != 0:
+        print(f"[回写] 跳过：当前目录不是 git 仓库（{err[:120]}）")
+        return None, "nogit"
+    root = out.splitlines()[-1].strip()
+    # 护栏：只认「真正属于本项目的仓库」。git 会一路向上找到最近的上层仓库，
+    # 若脚本被放到别的目录下运行，可能把日报误提交进不相干的仓库（实测用户主目录
+    # 就是一个 git repo）。本项目的标志是根下有 .github/workflows。
+    if not os.path.isdir(os.path.join(root, ".github", "workflows")):
+        print(f"[回写] 跳过：{root} 不是本项目仓库（根下无 .github/workflows）")
+        return None, "notarget"
+    return root, "ok"
+
+
+def _repo_rel(path):
+    """绝对路径 → 仓库相对路径（正斜杠）。不在本项目仓库内则返回 None。"""
+    root, _ = _repo_root()
+    if root is None:
+        return None
+    return os.path.relpath(os.path.abspath(path), root).replace("\\", "/")
+
+
+def commit_paths_back(rels, message, enabled=None):
+    """暂存 → 提交 → 推送若干「仓库相对路径」（支持已跟踪文件的删除）。
+
+    返回状态字符串：ok / nochange / skipped / nogit / notarget /
+    commit-failed / push-failed / error
+    """
+    if not _commit_enabled(enabled):
+        print("[回写] 跳过（非 CI 环境且未显式开启；设 NEWSHUB_COMMIT_BACK=1 可强制）")
+        return "skipped"
+    try:
+        root, status = _repo_root()
+        if root is None:
+            return status
+        branch = os.environ.get("GITHUB_REF_NAME") or "main"
+
+        # 浅克隆（checkout 默认 fetch-depth: 1）直接 push 可能被拒，先补全历史
+        if _git(["fetch", "--unshallow"], root)[0] != 0:
+            _git(["fetch", "--depth=100", "origin", branch], root)
+
+        _git(["config", "user.name", "github-actions[bot]"], root)
+        _git(["config", "user.email",
+              "41898282+github-actions[bot]@users.noreply.github.com"], root)
+
+        # 逐个暂存：路径既不存在又未被跟踪时 git 会因 pathspec 不匹配报错，
+        # 这属于「本来就没东西可提交」，不是故障，忽略即可。
+        for rel in rels:
+            _git(["add", "-A", "--", rel], root)
+        code, out, _ = _git(["status", "--porcelain", "--"] + rels, root)
+        if code != 0 or not out.strip():
+            print("[回写] 无变化，无需重复入库")
+            return "nochange"
+
+        code, _, err = _git(["commit", "-m", message, "--"] + rels, root)
+        if code != 0:
+            print(f"[回写] commit 失败：{err[:200]}")
+            return "commit-failed"
+
+        code, _, err = _git(["push", "origin", f"HEAD:{branch}"], root)
+        if code != 0:
+            print(f"[回写] push 失败：{err[:200]}"
+                  f"\n       本地提交已生成，但未推上远端")
+            return "push-failed"
+
+        print(f"[回写] 已入库并推送：{'、'.join(rels)} → {branch}")
+        return "ok"
+    except Exception as e:  # noqa: BLE001
+        print(f"[回写] 异常（已忽略，不影响出稿）：{type(e).__name__}: {e}")
+        return "error"
+
+
 def commit_report_back(report_path, report_name, enabled=None):
     """把当日日报提交回仓库，作为下一期的跨日去重基线。
 
@@ -673,72 +769,187 @@ def commit_report_back(report_path, report_name, enabled=None):
       · 本仓库 `default_workflow_permissions = write`，该 token 具备推送权限。
     若将来工作流里也加了回写步骤，二者互不冲突：本函数发现"无变化"即退出。
 
+    出稿成功时顺带清掉上一轮的故障通报 ALERT.json —— 于是「仓库里到底有没有
+    ALERT.json」就是最可靠的故障判据：有、且日期是今天 ⇒ 今天没出稿。
+
     任何一步失败都只打印告警，绝不影响当日出稿与 Pages 发布。
     返回状态字符串：ok / nochange / skipped / nogit / notarget / missing /
     commit-failed / push-failed / error
     """
-    if enabled is None:
-        ci = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
-        flag = (os.environ.get("NEWSHUB_COMMIT_BACK") or "").lower()
-        enabled = ci or flag in ("1", "true", "yes", "force")
-    if not enabled:
+    if not _commit_enabled(enabled):
         print("[回写] 跳过（非 CI 环境且未显式开启；设 NEWSHUB_COMMIT_BACK=1 可强制）")
         return "skipped"
-
     if not os.path.exists(report_path):
         print("[回写] 跳过：找不到日报文件")
         return "missing"
 
+    root, status = _repo_root()
+    if root is None:
+        return status
+    rel = os.path.relpath(os.path.abspath(report_path), root).replace("\\", "/")
+
+    rels = [rel]
+    stale = os.path.join(REPORT_DIR, ALERT_NAME)
+    if os.path.exists(stale):
+        os.remove(stale)
+        print(f"[回写] 已清除上一轮的故障通报 {ALERT_NAME}")
+    alert_rel = _repo_rel(stale)
+    # cwd 必须是仓库根：pathspec 是相对 cwd 解析的，在 skills/newshub 下查
+    # "skills/newshub/ALERT.json" 永远查不到，删除就永远提交不上去。
+    if alert_rel and _git(["ls-files", "--error-unmatch", "--", alert_rel],
+                          root)[0] == 0:
+        rels.append(alert_rel)          # 通报文件仍被跟踪 → 把删除一并提交
+
+    return commit_paths_back(rels, f"chore(news): 入库 {report_name}（跨日去重基线）",
+                             enabled=enabled)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 失败兜底：本轮不出稿时，把失败变成「可送达、可追溯」的通报
+# ══════════════════════════════════════════════════════════════════════
+def _run_url():
+    repo = os.environ.get("GITHUB_REPOSITORY") or "michaeldzh/newshub"
+    rid = os.environ.get("GITHUB_RUN_ID")
+    return (f"https://github.com/{repo}/actions/runs/{rid}" if rid
+            else f"https://github.com/{repo}/actions")
+
+
+def alert_html(payload):
+    def esc(s):
+        return (str(s or "").replace("&", "&amp;")
+                .replace("<", "&lt;").replace(">", "&gt;"))
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI 日报未出稿 | {esc(payload.get('date_cn'))}</title>
+<style>
+body{{font-family:-apple-system,'Microsoft YaHei',sans-serif;max-width:820px;margin:0 auto;padding:16px;line-height:1.6;color:#1f2328;font-size:15px}}
+.banner{{background:#fff1f0;border:1px solid #e8b4ae;border-left:8px solid #d93026;border-radius:6px;padding:14px 16px;margin-bottom:18px}}
+.banner h1{{font-size:20px;margin:0 0 8px;color:#b3261e}}
+.banner p{{margin:3px 0}}
+b.k{{color:#5a6472;font-weight:600}}
+pre{{background:#f6f8fa;border:1px solid #e2e6ea;border-radius:6px;padding:10px;white-space:pre-wrap;word-break:break-all;font-size:12.5px;color:#39414d}}
+a{{color:#2d6cdf;text-decoration:none}}
+.meta{{color:#8a929c;font-size:12.5px;margin-top:18px}}
+</style></head><body>
+<div class="banner">
+<h1>今日 AI 日报未出稿</h1>
+<p>日期：<b class="k">{esc(payload.get('date_cn'))}</b>　失败阶段：<b class="k">{esc(payload.get('stage'))}</b></p>
+<p>直接原因：<b class="k">{esc(payload.get('reason'))}</b></p>
+</div>
+<p>本邮件由流水线自带的「失败兜底」发出。生成脚本本轮没有产出可发布的日报，
+于是把失败原因写成了这一页，借既有的发信步骤送达 —— 目的是不再出现
+「整天没出稿、却无人知晓」的情况。</p>
+<p>排查入口：<a href="{esc(payload.get('run_url'))}" target="_blank">{esc(payload.get('run_url'))}</a></p>
+<h3>完整诊断</h3>
+<pre>{esc(payload.get('detail'))}</pre>
+<p class="meta">生成时间 {esc(payload.get('generated_at'))}　·　故障标记 ALERT.json　·　
+本页同时发布在 GitHub Pages</p>
+</body></html>"""
+
+
+def emit_alert(stage, detail, extra=None):
+    """本轮不出稿时，把失败落盘成三份互为冗余的通报。
+
+    为什么不能用工作流的 `if: failure()` 步骤
+    ----------------------------------------
+    那需要改 `.github/workflows/ai-news.yml`，而本机 PAT 缺 `workflow` 作用域，
+    GitHub 一律 403 拒收（Contents API 与 Git Data API 同样被拒）。工作流默认又是
+    `if: success()`：生成步骤一失败，后面的「Push report to email」直接跳过 ——
+    失败于是彻底静默（9/20、9/23 用户都是几天后才发现）。
+
+    绕开方式：让生成步骤「成功」退出，但把失败写成通报，借既有的发信步骤送达：
+      ① 邮件   —— index.html 就是故障通报页，push_email.py 检测到 ALERT.json
+                  会改用「⚠️ 未出稿」主题，收件人第一眼就知道今天没有日报；
+      ② Pages  —— index.html 照常发布到站点；
+      ③ 仓库   —— ALERT.json 提交入库（下次出稿时自动删除），
+                  机器可读，且「有没有这个文件」本身就是判据；
+      ④ 运行页 —— 摘要写入 $GITHUB_STEP_SUMMARY，Actions 页面顶部可见。
+
+    本函数自身绝不抛异常：兜底逻辑把主流程再炸一次毫无意义。
+    """
+    detail = detail or ""
+    payload = {
+        "alert": True,
+        "date": str(DATE),
+        "date_cn": DATE_STR,
+        "stage": stage,
+        "reason": (detail.splitlines() or [""])[0][:300],
+        "detail": detail[:4000],
+        "run_url": _run_url(),
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if extra:
+        payload.update(extra)
+
+    # 半成品日报绝不外发 —— 宁可发通报，也不发一份没走完闸门的稿子
+    if os.path.exists(OUT_MD_PATH):
+        os.remove(OUT_MD_PATH)
+
+    ap = os.path.join(REPORT_DIR, ALERT_NAME)
+    with open(ap, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(REPORT_DIR, "index.html"), "w", encoding="utf-8") as f:
+        f.write(alert_html(payload))
+    print(f"[ALERT] 通报已落盘：{ALERT_NAME} + index.html")
+
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        try:
+            with open(summary, "a", encoding="utf-8") as f:
+                f.write(f"## ⚠️ 今日未出稿（{DATE_STR}）\n\n"
+                        f"- 失败阶段：{stage}\n- 直接原因：{payload['reason']}\n"
+                        f"- 运行地址：{payload['run_url']}\n")
+        except Exception as e:  # noqa: BLE001
+            print(f"[ALERT] 写 step summary 失败（无关紧要）：{e}")
+
+    if (os.environ.get("NEWSHUB_ALERT") or "").lower() in ("0", "false", "no"):
+        print("[ALERT] NEWSHUB_ALERT 已关闭入库，仅本地落盘")
+        return payload
+    rel = _repo_rel(ap)
+    if rel:
+        commit_paths_back([rel], f"alert(news): {DATE_STR} 未出稿 —— "
+                                 f"{payload['reason'][:60]}")
+    return payload
+
+
+def _abort(stage, detail):
+    """失败收口：落盘通报，然后**返回 0**（而不是 1）。
+
+    为什么返回 0：见 emit_alert() 的说明 —— 只有让生成步骤成功，既有的发信步骤
+    才会执行，通报才能送出去。运行页变绿由 $GITHUB_STEP_SUMMARY 与仓库里的
+    ALERT.json 补偿，不会失去可见性。
+    """
+    first = (detail or "").splitlines()[0][:200] if detail else ""
+    print("\n" + "!" * 66)
+    print(f"[ALERT] {stage}：{first}")
+    print("!" * 66)
     try:
-        code, out, err = _git(["rev-parse", "--show-toplevel"], REPORT_DIR)
-        if code != 0:
-            print(f"[回写] 跳过：当前目录不是 git 仓库（{err[:120]}）")
-            return "nogit"
-        root = out.splitlines()[-1].strip()
-        rel = os.path.relpath(os.path.abspath(report_path), root).replace("\\", "/")
-        branch = os.environ.get("GITHUB_REF_NAME") or "main"
-
-        # 护栏：只认「真正属于本项目的仓库」。git 会一路向上找到最近的上层仓库，
-        # 若脚本被放到别的目录下运行，可能把日报误提交进不相干的仓库（实测用户主目录
-        # 就是一个 git repo）。本项目的标志是根下有 .github/workflows。
-        if not os.path.isdir(os.path.join(root, ".github", "workflows")):
-            print(f"[回写] 跳过：{root} 不是本项目仓库（根下无 .github/workflows）")
-            return "notarget"
-
-        # 浅克隆（checkout 默认 fetch-depth: 1）直接 push 可能被拒，先补全历史
-        if _git(["fetch", "--unshallow"], root)[0] != 0:
-            _git(["fetch", "--depth=100", "origin", branch], root)
-
-        _git(["config", "user.name", "github-actions[bot]"], root)
-        _git(["config", "user.email",
-              "41898282+github-actions[bot]@users.noreply.github.com"], root)
-
-        _git(["add", "--", rel], root)
-        code, out, _ = _git(["status", "--porcelain", "--", rel], root)
-        if code != 0 or not out.strip():
-            print("[回写] 日报无变化（可能已由工作流步骤提交），无需重复入库")
-            return "nochange"
-
-        msg = f"chore(news): 入库 {report_name}（跨日去重基线）"
-        code, _, err = _git(["commit", "-m", msg, "--", rel], root)
-        if code != 0:
-            print(f"[回写] commit 失败：{err[:200]}")
-            return "commit-failed"
-
-        code, _, err = _git(["push", "origin", f"HEAD:{branch}"], root)
-        if code != 0:
-            print(f"[回写] push 失败：{err[:200]}"
-                  f"\n       本期日报已正常发布，但去重基线本期未更新")
-            return "push-failed"
-
-        print(f"[回写] 已入库并推送：{rel} → {branch}")
-        return "ok"
+        emit_alert(stage, detail)
     except Exception as e:  # noqa: BLE001
-        print(f"[回写] 异常（已忽略，不影响出稿）：{type(e).__name__}: {e}")
-        return "error"
+        print(f"[ALERT] 通报落盘失败（不再抛出）：{type(e).__name__}: {e}")
+    print("[ALERT] 本轮不出稿；通报页将随既有的邮件步骤送达。")
+    return 0
 
 
 def main():
+    """统一入口：把任何失败转成「故障通报」，而不只是终止进程。"""
+    try:
+        return _run()
+    except SystemExit as exc:
+        code = exc.code
+        if code in (0, None):
+            return 0
+        return _abort("生成中止", str(code))
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return _abort("未捕获异常",
+                      f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}")
+
+
+def _run():
+    _require_api_key()
     print("=" * 66)
     print(f"AI 资讯生成 | {DATE_STR} | 报告目录 {REPORT_DIR}")
     print("=" * 66)
@@ -749,7 +960,7 @@ def main():
           f"{len(history.urls)} 条链接 / {len(history.fps)} 条事件指纹")
     if not history.files:
         print("  [warn] 未读到任何历史日报 —— 跨日去重将无基准。"
-              "请确认工作流已把历史日报提交回仓库（见 ai-news.yml 的 Commit report 步骤）")
+              "请确认回写是否生效（回写由本脚本的 commit_report_back() 完成）")
 
     # 2) 素材：先用全历史做确定性预筛，再送进提示词
     raw_results = gather()
