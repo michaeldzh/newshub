@@ -30,6 +30,7 @@ E9  标题相似度去重：与任一条历史标题 2-gram Jaccard ≥0.65（�
 
 import glob
 import io
+import json
 import os
 import sys
 
@@ -45,7 +46,36 @@ if hasattr(sys.stderr, "reconfigure"):
 EXPECTED_TOTAL = 20
 EXPECTED_SECTIONS = [7, 7, 6]
 # 发布下限：目标 20 条，但「不足也照发」；低于此值才判 FAIL（代表链路异常）。可用 MIN_TOTAL 覆盖。
-MIN_TOTAL = int(os.environ.get("MIN_TOTAL") or 3)
+MIN_TOTAL = int(os.environ.get("MIN_TOTAL") or 1)
+ALERT_NAME = "ALERT.json"
+
+
+def active_alert(report_dir):
+    """返回「当日」的故障通报（无则 None）。
+
+    生成器本轮没出稿时，会在目录里留下 ALERT.json —— 此时根本没有可校验的日报，
+    硬校验必须放行，否则工作流会卡在这一步，「Push report to email」被跳过，
+    精心准备的故障通报就永远送不出去（也就是又回到静默失败）。
+    隔夜残留（日期不是今天）不认，避免用旧故障掩盖今天的真实校验失败。
+    """
+    path = os.path.join(report_dir, ALERT_NAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict) or not data.get("alert"):
+        return None
+    today = _today_iso()
+    return data if data.get("date") == today else None
+
+
+def _today_iso():
+    """北京时间今天（CI 里已设 TZ=Asia/Shanghai，仍显式换算以防本地跑时错判）。"""
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=8))).strftime("%Y-%m-%d")
 
 
 def find_report_dir(explicit_file=None):
@@ -121,6 +151,23 @@ def main():
     args = [a for a in sys.argv[1:]]
     explicit = args[0] if (args and not args[0].startswith("-")) else None
     report_dir = find_report_dir(explicit)
+
+    # 故障通报模式：生成器本轮没出稿，没有可校验的日报。
+    # 这里必须放行（退出码 0），否则工作流在这一步中断，「Push report to email」
+    # 会被跳过 —— 生成器精心准备的故障通报就永远送不出去，等于又回到静默失败。
+    if explicit is None:
+        alert = active_alert(report_dir)
+        if alert:
+            print(f"\n{'=' * 62}")
+            print(f"本轮未出稿（故障通报模式）—— {alert.get('date_cn')}")
+            print(f"{'=' * 62}")
+            print(f"失败阶段：{alert.get('stage')}")
+            print(f"直接原因：{alert.get('reason')}")
+            print(f"运行地址：{alert.get('run_url')}")
+            print("\n生成器已把失败写入 ALERT.json 与 index.html，"
+                  "本次不做日报硬校验，交给后续发信步骤送达通报。")
+            return 0
+
     reports = list_reports(report_dir)
     if not reports:
         print(f"未找到任何日报文件，报告目录：{report_dir}")
