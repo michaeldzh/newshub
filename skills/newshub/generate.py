@@ -73,6 +73,12 @@ MATERIAL_LIMIT = int(os.environ.get("MATERIAL_LIMIT") or 120)
 SECTION_ORDINALS = "一二三四"
 # 故障通报文件名（仓库内可见，且是「上一轮是否失败」的机器可读判据）
 ALERT_NAME = "ALERT.json"
+# 落款（用户 2026-09-25 要求）：出现在日报邮件正文末尾，以及故障通报页末尾。
+# 邮件正文就是 index.html，所以改这里等于同时改了邮件与 Pages 页面。
+SITE = "yxrsai.com"
+SITE_URL = "https://" + SITE
+SIGNATURE = f"本资讯由 {SITE} 生成并发送"
+SIGNATURE_HTML = f'本资讯由 <a href="{SITE_URL}">{SITE}</a> 生成并发送'
 
 
 def _require_api_key():
@@ -577,7 +583,11 @@ p{{margin:4px 0 10px}}
 a{{color:#2d6cdf;text-decoration:none}}
 ul{{background:#f7f9fc;border-left:4px solid #2d6cdf;padding:8px 18px;margin:6px 0}}
 li{{margin:3px 0}}
-</style></head><body>{body}</body></html>"""
+.sign{{margin-top:26px;padding-top:14px;border-top:1px solid #e5e9f0;font-size:12.5px;color:#8a93a2;text-align:center}}
+.sign a{{color:#8a93a2}}
+</style></head><body>{body}
+<div class="sign">{SIGNATURE_HTML}</div>
+</body></html>"""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -831,6 +841,8 @@ b.k{{color:#5a6472;font-weight:600}}
 pre{{background:#f6f8fa;border:1px solid #e2e6ea;border-radius:6px;padding:10px;white-space:pre-wrap;word-break:break-all;font-size:12.5px;color:#39414d}}
 a{{color:#2d6cdf;text-decoration:none}}
 .meta{{color:#8a929c;font-size:12.5px;margin-top:18px}}
+.sign{{margin-top:26px;padding-top:14px;border-top:1px solid #eceff3;font-size:12.5px;color:#8a93a2;text-align:center}}
+.sign a{{color:#8a93a2}}
 </style></head><body>
 <div class="banner">
 <h1>今日 AI 日报未出稿</h1>
@@ -845,6 +857,7 @@ a{{color:#2d6cdf;text-decoration:none}}
 <pre>{esc(payload.get('detail'))}</pre>
 <p class="meta">生成时间 {esc(payload.get('generated_at'))}　·　故障标记 ALERT.json　·　
 本页同时发布在 GitHub Pages</p>
+<div class="sign">{SIGNATURE_HTML}</div>
 </body></html>"""
 
 
