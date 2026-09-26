@@ -11,6 +11,19 @@ description: 生成并推送每日 AI 资讯日报。检索过去 24 小时全�
 3. **check_report.py** — 成稿硬校验（E1–E9），CI 与本地通用。
 4. **push_email.py** — 将报告经 163 SMTP 推送（HTML 正文 + Markdown 附件）。
 
+## 邮件落款（2026-09-25 起）
+
+日报邮件正文（就是 `index.html`）与故障通报页的**最末尾**统一署名：
+
+> 本资讯由 [yxrsai.com](https://yxrsai.com) 生成并发送
+
+- 落款常量在 `generate.py` 顶部：`SITE` / `SITE_URL` / `SIGNATURE`（纯文本）/ `SIGNATURE_HTML`（带链接）。
+  改这一处，CI 日报正文与 CI 故障通报页同时生效。
+- 本地 agently-cli 发信通道（`.workbuddy/automations/ai/send_report_mail.py`）的 `build_html()` 里
+  有一份对应落款，改文案时两处都要动。
+- 落款只加在**邮件正文**里，`AI资讯24小时_*.md` 原文与附件保持不变 —— 避免落入闸门 E1–E9 的字段解析范围。
+- 回归测试：`_out/test_signature.py`（18 项断言，纯渲染、不碰 git、不删文件）。
+
 ## 运行方式
 ```bash
 pip install -r requirements.txt
