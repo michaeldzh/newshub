@@ -1,0 +1,10 @@
+{
+  "alert": true,
+  "date": "2026-10-11",
+  "date_cn": "2026年10月11日",
+  "stage": "生成中止",
+  "reason": "ERROR: LLM 调用失败：503: {\"error\":{\"code\":\"model_not_found\",\"message\":\"分组 default 下模型 agnes-2.0-flash 无可用渠道（distributor） (request id: 2026101103343339802481vpJAkqwP)\",\"type\":\"AgnesAI_error\"}}",
+  "detail": "ERROR: LLM 调用失败：503: {\"error\":{\"code\":\"model_not_found\",\"message\":\"分组 default 下模型 agnes-2.0-flash 无可用渠道（distributor） (request id: 2026101103343339802481vpJAkqwP)\",\"type\":\"AgnesAI_error\"}}",
+  "run_url": "https://github.com/michaeldzh/newshub/actions/runs/38108618580",
+  "generated_at": "2026-10-11 03:34:33"
+}
