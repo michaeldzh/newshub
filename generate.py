@@ -30,7 +30,7 @@ v2 的做法：
 --------
   ANTHROPIC_API_KEY   必填，LLM 网关 Bearer key
   ANTHROPIC_BASE_URL  必填，网关基址（如 https://api.agnes-ai.cn/v1）
-  ANTHROPIC_MODEL     模型名，默认 agnes-2.0-flash；填错或该模型下线时，
+  ANTHROPIC_MODEL     模型名，默认 agnes-3.0-flash；填错或该模型下线时，
                       会按网关 GET /models 返回的清单自动挑替代模型（不必改 secret）
   TAVILY_API_KEY      可选，搜索源
   REPORT_DIR          可选，日报所在目录（默认本脚本目录）
@@ -59,7 +59,7 @@ import dedup
 REPORT_DIR = os.environ.get("REPORT_DIR") or os.path.dirname(os.path.abspath(__file__))
 API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 BASE_URL = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.agnes-ai.cn/v1").rstrip("/")
-MODEL = os.environ.get("ANTHROPIC_MODEL") or "agnes-2.0-flash"
+MODEL = os.environ.get("ANTHROPIC_MODEL") or "agnes-3.0-flash"
 CHAT_ENDPOINT = BASE_URL + "/chat/completions"
 HISTORY_PROMPT_LIMIT = int(os.environ.get("HISTORY_PROMPT_LIMIT") or 240)
 MAX_REPAIR_ROUNDS = int(os.environ.get("MAX_REPAIR_ROUNDS") or 3)
@@ -490,6 +490,8 @@ RETRY_BACKOFF = [10, 30, 60, 90]
 #   503 model_not_found「分组 default 下模型 agnes-2.0-flash 无可用渠道（distributor）」
 # 这是**供应商侧**模型下线/改名的典型症状 —— 重试多少次都没用。更糟的是它披着
 # 503 的皮，被当成「瞬时限流」白等 190 秒退避，最后还是空窗。
+# 收口（2026-10-12）：加候选链后同一批素材自动改走 agnes-2.5-flash 出稿成功（18 条）；
+# 同日把配置模型换成 agnes-3.0-flash（2.0 那条线已被供应商下线，网关 /models 里没了）。
 # 对策：把「模型名」变成一条可轮换的候选链 —— 先用配置里指定的，再按网关自己
 # 的 /models 列表补齐（自动过滤掉图像/视频/语音/向量类），逐个试；遇到「模型不可用」
 # 立刻换下一个而不是死等，成功过的那个自动提到队首供后续（补稿）复用。
@@ -598,7 +600,10 @@ def _llm_once(model, user_msg, max_tokens):
         except Exception as e:  # noqa: BLE001
             return False, f"响应解析失败：{type(e).__name__}: {e}｜{body}", "fatal"
         if not text:
-            return False, f"模型未返回正文（网关可能不支持该模型）｜{body}", "fatal"
+            # 200 但没有正文 —— 网关自己的提示就是「可能不支持该模型」，属**模型级**问题。
+            # 因此归到 missing 而非 fatal：新上线的模型最典型的失败形态就是「收下请求、
+            # 回空体」，若判成 fatal 会直接收口 → 整期空窗。换下一个才对症。
+            return False, f"模型未返回正文（网关可能不支持该模型）｜{body}", "missing"
         return True, text, "ok"
     if _model_missing(resp.status_code, body):
         return False, f"{resp.status_code}: {body}", "missing"
