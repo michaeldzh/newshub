@@ -30,7 +30,8 @@ v2 的做法：
 --------
   ANTHROPIC_API_KEY   必填，LLM 网关 Bearer key
   ANTHROPIC_BASE_URL  必填，网关基址（如 https://api.agnes-ai.cn/v1）
-  ANTHROPIC_MODEL     模型名，默认 agnes-2.0-flash
+  ANTHROPIC_MODEL     模型名，默认 agnes-2.0-flash；填错或该模型下线时，
+                      会按网关 GET /models 返回的清单自动挑替代模型（不必改 secret）
   TAVILY_API_KEY      可选，搜索源
   REPORT_DIR          可选，日报所在目录（默认本脚本目录）
   HISTORY_PROMPT_LIMIT 可选，提示词中注入的历史条目上限（默认 240）
@@ -482,54 +483,175 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 RETRY_BACKOFF = [10, 30, 60, 90]
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 模型选择：单一模型挂掉不该让整期空窗
+# ══════════════════════════════════════════════════════════════════════
+# 事故（2026-10-11、10-12 连续两天不出稿）：agnes 网关返回
+#   503 model_not_found「分组 default 下模型 agnes-2.0-flash 无可用渠道（distributor）」
+# 这是**供应商侧**模型下线/改名的典型症状 —— 重试多少次都没用。更糟的是它披着
+# 503 的皮，被当成「瞬时限流」白等 190 秒退避，最后还是空窗。
+# 对策：把「模型名」变成一条可轮换的候选链 —— 先用配置里指定的，再按网关自己
+# 的 /models 列表补齐（自动过滤掉图像/视频/语音/向量类），逐个试；遇到「模型不可用」
+# 立刻换下一个而不是死等，成功过的那个自动提到队首供后续（补稿）复用。
+NON_CHAT_HINTS = (
+    "image", "img", "video", "tts", "asr", "whisper", "speech", "audio", "voice",
+    "embed", "rerank", "moderation", "ocr", "-sd", "flux", "kling", "veo", "sora",
+    "seedance", "seedream", "dall", "midjourney", "upscale", "matting", "avatar",
+)
+CHAT_HINTS = (
+    "flash", "chat", "pro", "max", "plus", "turbo", "instruct", "reason", "thinking",
+    "gpt", "claude", "gemini", "glm", "qwen", "deepseek", "kimi", "grok", "llama",
+    "mistral", "doubao", "hunyuan", "ernie", "minimax", "abab", "step", "spark",
+    "moonshot", "sonnet", "opus", "haiku", "agnes",
+)
+MODEL_CANDIDATE_LIMIT = 6
+_MODEL_CACHE = None
+
+
+def _model_missing(status, body):
+    """判断这次失败是不是「这个模型名在这条线上不存在」。
+
+    这类错误换模型就能解决，退避重试毫无意义 —— 必须单独识别出来。
+    """
+    low = (body or "").lower()
+    if "model_not_found" in low or "model not found" in low:
+        return True
+    if "无可用渠道" in (body or "") or "no available channel" in low:
+        return True
+    if "distributor" in low and "model" in low:
+        return True
+    return status == 404 and "model" in low
+
+
+def discover_models():
+    """问网关要一份可用模型清单（OpenAI 兼容的 GET /models）。
+
+    拿到清单是「自愈」的关键：供应商改名/下线模型后，脚本不必等人改 secret。
+    任何异常都只降级为「拿不到列表」，不影响主流程。
+    """
+    try:
+        resp = requests.get(BASE_URL + "/models",
+                            headers={"Authorization": f"Bearer {API_KEY}"},
+                            timeout=25)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] 列举模型异常：{type(e).__name__}: {e}")
+        return []
+    if resp.status_code != 200:
+        print(f"  [warn] 列举模型失败：{resp.status_code} {resp.text[:120]}")
+        return []
+    try:
+        items = resp.json().get("data") or []
+    except Exception:  # noqa: BLE001
+        return []
+    ids = [m.get("id") for m in items if isinstance(m, dict) and m.get("id")]
+    print(f"  [model] 网关可用模型 {len(ids)} 个")
+    return ids
+
+
+def model_candidates():
+    """有序候选链：配置指定的模型 → 网关列表里的对话模型（优先像对话的那些）。
+
+    结果缓存，避免补稿轮次重复请求；一旦某个模型跑通，会被提到队首。
+    """
+    global _MODEL_CACHE
+    if _MODEL_CACHE is not None:
+        return _MODEL_CACHE
+    chat = [i for i in discover_models()
+            if not any(h in i.lower() for h in NON_CHAT_HINTS)]
+    chat.sort(key=lambda i: (0 if any(h in i.lower() for h in CHAT_HINTS) else 1, i))
+    out = []
+    for m in [MODEL] + chat:
+        if m and m not in out:
+            out.append(m)
+    out = out[:MODEL_CANDIDATE_LIMIT]
+    if len(out) > 1:
+        print(f"  [model] 候选链：{' → '.join(out)}")
+    _MODEL_CACHE = out
+    return out
+
+
+def _promote_model(model):
+    """把跑通的模型提到队首 —— 后续补稿轮次直接命中，不必再从头试错。"""
+    global _MODEL_CACHE
+    if _MODEL_CACHE and _MODEL_CACHE[0] != model:
+        _MODEL_CACHE = [model] + [m for m in _MODEL_CACHE if m != model]
+
+
+def _llm_once(model, user_msg, max_tokens):
+    """单次调用。返回 (ok, 文本或错误串, 类型)，类型 ∈ ok/retry/fatal/missing。"""
+    try:
+        resp = requests.post(
+            CHAT_ENDPOINT,
+            headers={"Authorization": f"Bearer {API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": model, "max_tokens": max_tokens,
+                  "messages": [{"role": "user", "content": user_msg}],
+                  "temperature": 0.3},
+            timeout=300,
+        )
+    except Exception as e:  # noqa: BLE001 —— 网络抖动同样值得重试
+        return False, f"{type(e).__name__}: {e}", "retry"
+    body = resp.text[:300]
+    if resp.status_code == 200:
+        try:
+            text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        except Exception as e:  # noqa: BLE001
+            return False, f"响应解析失败：{type(e).__name__}: {e}｜{body}", "fatal"
+        if not text:
+            return False, f"模型未返回正文（网关可能不支持该模型）｜{body}", "fatal"
+        return True, text, "ok"
+    if _model_missing(resp.status_code, body):
+        return False, f"{resp.status_code}: {body}", "missing"
+    if resp.status_code in RETRY_STATUS:
+        return False, f"{resp.status_code}: {body}", "retry"
+    return False, f"{resp.status_code}: {body}", "fatal"
+
+
 def call_llm(user_msg, max_tokens=8000, soft=False):
-    """调用 LLM。瞬时限流/网关错误会退避重试。
+    """调用 LLM：先在同一模型上退避重试，再沿候选链换模型。
 
     soft=False（默认）：最终仍失败则抛 SystemExit —— 用于首轮生成，
       此时没有任何可发布内容，终止是正确行为。
     soft=True：最终仍失败返回 None —— 用于「补稿」轮。补稿只是锦上添花，
       不能因为一次 429 就把已经合格的内容整期丢掉（2026-09-19 线上事故）。
-    """
-    last = "未知错误"
-    for attempt in range(len(RETRY_BACKOFF) + 1):
-        if attempt:
-            wait = RETRY_BACKOFF[attempt - 1]
-            print(f"  [warn] LLM 调用重试 {attempt}/{len(RETRY_BACKOFF)}，"
-                  f"{wait}s 后重试（{last[:120]}）")
-            time.sleep(wait)
-        try:
-            resp = requests.post(
-                CHAT_ENDPOINT,
-                headers={"Authorization": f"Bearer {API_KEY}",
-                         "Content-Type": "application/json"},
-                json={"model": MODEL, "max_tokens": max_tokens,
-                      "messages": [{"role": "user", "content": user_msg}],
-                      "temperature": 0.3},
-                timeout=300,
-            )
-        except Exception as e:  # noqa: BLE001 —— 网络抖动同样值得重试
-            last = f"{type(e).__name__}: {e}"
-            if attempt == len(RETRY_BACKOFF):
-                break
-            continue
-        if resp.status_code in RETRY_STATUS:
-            last = f"{resp.status_code}: {resp.text[:300]}"
-            if attempt == len(RETRY_BACKOFF):
-                break
-            continue
-        if resp.status_code != 200:
-            last = f"{resp.status_code}: {resp.text[:300]}"
-            break                      # 4xx 业务错误（如模型名不对）重试无意义
-        text = (resp.json()["choices"][0]["message"]["content"] or "").strip()
-        if not text:
-            last = "模型未返回正文（网关可能不支持该模型）"
-            break
-        return text
 
+    两层容错的分工要分清楚：
+      · 429/5xx 这类**瞬时**故障 → 同一模型退避重试（换模型没用，限流是账号级的）；
+      · model_not_found「无可用渠道」→ 立刻换下一个模型（重试永远好不了，
+        这正是一次 3 分钟退避白等、整天不出稿的原因）。
+    """
+    candidates = model_candidates()
+    failures = []
+    for idx, model in enumerate(candidates):
+        last = "未知错误"
+        kind = "retry"
+        for attempt in range(len(RETRY_BACKOFF) + 1):
+            if attempt:
+                wait = RETRY_BACKOFF[attempt - 1]
+                print(f"  [warn] LLM 调用重试 {attempt}/{len(RETRY_BACKOFF)}，"
+                      f"{wait}s 后重试（{last[:120]}）")
+                time.sleep(wait)
+            ok, payload, kind = _llm_once(model, user_msg, max_tokens)
+            if ok:
+                if idx:
+                    print(f"  [model] 已改用可用模型：{model}")
+                _promote_model(model)
+                return payload
+            last = payload
+            if kind in ("missing", "fatal"):
+                break              # 换模型 / 直接收口，都不该继续等
+        failures.append(f"{model} → {last[:200]}")
+        if kind == "missing" and idx + 1 < len(candidates):
+            print(f"  [warn] 模型不可用，换下一个：{model} → {candidates[idx + 1]}"
+                  f"（{last[:160]}）")
+            continue
+        break                      # 重试耗尽或业务性错误：换模型也救不了
+
+    detail = "；".join(failures) if failures else "未知错误"
     if soft:
-        print(f"  [warn] LLM 调用最终失败，跳过本次补稿：{last[:200]}")
+        print(f"  [warn] LLM 调用最终失败，跳过本次补稿：{detail[:300]}")
         return None
-    raise SystemExit(f"ERROR: LLM 调用失败：{last[:500]}")
+    raise SystemExit(f"ERROR: LLM 调用失败：{detail[:500]}")
 
 
 # ══════════════════════════════════════════════════════════════════════
